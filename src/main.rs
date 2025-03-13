@@ -170,7 +170,7 @@ async fn main() {
     env_logger::init();
     println!("{}", CIRUN_BANNER);
     let args = Args::parse();
-    let client = CirunClient::new("https://api.cirun.io", &args.api_token);
+    let client = CirunClient::new("https://api.cirun.io/api/", &args.api_token);
 
     loop {
         match client.get_command().await {
