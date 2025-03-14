@@ -56,6 +56,14 @@ struct AgentInfo {
 #[derive(Debug, Serialize, Deserialize)]
 struct ApiResponse {
     command: String,
+    #[serde(default)]
+    runners: Vec<RunnerToProvision>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RunnerToProvision {
+    name: String,
+    provision_script: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -83,6 +91,35 @@ impl CirunClient {
         }
     }
 
+    async fn provision_runner(&self, runner_name: &str, provision_script: &str) -> Result<(), Box<dyn std::error::Error>> {
+        match LumeClient::new() {
+            Ok(lume) => {
+                // Read SSH credentials from environment variables or use defaults
+                let username = env::var("LUME_SSH_USER").unwrap_or_else(|_| "lume".to_string());
+                let password = env::var("LUME_SSH_PASSWORD").unwrap_or_else(|_| "lume".to_string());
+
+                info!("Provisioning runner: {}", runner_name);
+                info!("Running provision script on VM");
+
+                match run_script_on_vm(&lume, runner_name, provision_script, &username, &password, 300, true).await {
+                    Ok(output) => {
+                        info!("Runner provisioning completed successfully");
+                        info!("Script output: {}", output);
+                        Ok(())
+                    },
+                    Err(e) => {
+                        error!("Failed to provision runner: {}", e);
+                        Err(e.into())
+                    }
+                }
+            },
+            Err(e) => {
+                error!("Failed to initialize Lume client: {:?}", e);
+                Err(e.into())
+            }
+        }
+    }
+
     async fn get_command(&self) -> Result<ApiResponse, Error> {
         let url = format!("{}/agent", self.base_url);
         info!("Fetching command from: {}", url);
@@ -99,6 +136,17 @@ impl CirunClient {
         info!("Response: {}", response.status());
         let json: ApiResponse = response.json().await?;
         info!("Received command: {}", json.command);
+
+        // Handle any runners that need provisioning
+        // Check if there are any runners to provision
+        if !json.runners.is_empty() {
+            for runner in &json.runners {
+                match self.provision_runner(&runner.name, &runner.provision_script).await {
+                    Ok(_) => info!("Successfully provisioned runner: {}", runner.name),
+                    Err(e) => error!("Failed to provision runner {}: {}", runner.name, e),
+                }
+            }
+        }
         Ok(json)
     }
 
