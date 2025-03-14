@@ -7,7 +7,7 @@ pub mod lume {
     use std::time::Duration;
     use serde::de::StdError;
 
-    const DEFAULT_API_URL: &str = "http://localhost:3000/lume";
+    const DEFAULT_API_URL: &str = "http://127.0.0.1:3000/lume";
     const CONNECT_TIMEOUT: u64 = 6000; // 5 minutes
     const MAX_TIMEOUT: u64 = 5000; // 5 minutes
 
