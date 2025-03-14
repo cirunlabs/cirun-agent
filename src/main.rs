@@ -1,3 +1,5 @@
+mod lume;
+
 use clap::Parser;
 use reqwest::{Client, Error};
 use serde::{Deserialize, Serialize};
@@ -14,6 +16,7 @@ use std::fs;
 use std::path::Path;
 use std::env;
 use std::process::Command as StdCommand;
+use crate::lume::lume::LumeClient;
 
 const CIRUN_BANNER: &str = r#"
        _                       _                    _
@@ -275,6 +278,29 @@ async fn main() {
     let client = CirunClient::new("http://localhost:8080/api/v1", &args.api_token, agent_info);
 
     loop {
+        match LumeClient::new() {
+            Ok(lume) => {
+                println!("Lume client initialized");
+
+                // Example: List all VMs
+                match lume.list_vms().await {
+                    Ok(vms) => {
+                        println!("Found {} VMs", vms.len());
+                        for vm in vms {
+                            println!("- {} ({}, {}, CPU: {}, Memory: {}, Disk: {})",
+                                     vm.name, vm.state, vm.os, vm.cpu, vm.memory, vm.disk_size.total);
+                        }
+                    },
+                    Err(e) => eprintln!("Failed to list VMs: {:?}", e),
+                }
+            },
+            Err(e) => {
+                eprintln!("Failed to initialize Lume client: {:?}", e);
+                // You might want to add a delay before retrying
+                // or handle this error differently
+            }
+        }
+
         match client.get_command().await {
             Ok(response) => {
                 if !response.command.is_empty() {
