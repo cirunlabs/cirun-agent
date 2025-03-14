@@ -94,27 +94,60 @@ impl CirunClient {
     async fn provision_runner(&self, runner_name: &str, provision_script: &str) -> Result<(), Box<dyn std::error::Error>> {
         match LumeClient::new() {
             Ok(lume) => {
+                // Check if VM exists by trying to get its details
+                let vm_exists = match lume.get_vm(runner_name).await {
+                    Ok(_) => true,
+                    Err(_) => false,
+                };
+
+                // If VM doesn't exist, try to clone it from the template
+                if !vm_exists {
+                    log::info!("VM '{}' does not exist. Attempting to clone from template...", runner_name);
+
+                    // Check if template exists
+                    match lume.get_vm("cirun-runner-template").await {
+                        Ok(_) => {
+                            // Template exists, clone it
+                            match lume.clone_vm("cirun-runner-template", runner_name).await {
+                                Ok(_) => {
+                                    log::info!("VM '{}' cloned successfully from template", runner_name);
+                                    // Continue with provisioning below
+                                },
+                                Err(e) => {
+                                    log::error!("Failed to clone VM from template: {:?}", e);
+                                    return Err(format!("Failed to clone VM from template: {:?}", e).into());
+                                }
+                            }
+                        },
+                        Err(e) => {
+                            // Template doesn't exist
+                            log::error!("Template 'cirun-runner-template' not found: {:?}", e);
+                            return Err("Template 'cirun-runner-template' not found. Cannot provision runner.".into());
+                        }
+                    }
+                }
+
                 // Read SSH credentials from environment variables or use defaults
                 let username = env::var("LUME_SSH_USER").unwrap_or_else(|_| "lume".to_string());
                 let password = env::var("LUME_SSH_PASSWORD").unwrap_or_else(|_| "lume".to_string());
 
-                info!("Provisioning runner: {}", runner_name);
-                info!("Running provision script on VM");
+                log::info!("Provisioning runner: {}", runner_name);
+                log::info!("Running provision script on VM");
 
                 match run_script_on_vm(&lume, runner_name, provision_script, &username, &password, 300, true).await {
                     Ok(output) => {
-                        info!("Runner provisioning completed successfully");
-                        info!("Script output: {}", output);
+                        log::info!("Runner provisioning completed successfully");
+                        log::info!("Script output: {}", output);
                         Ok(())
                     },
                     Err(e) => {
-                        error!("Failed to provision runner: {}", e);
+                        log::error!("Failed to provision runner: {}", e);
                         Err(e.into())
                     }
                 }
             },
             Err(e) => {
-                error!("Failed to initialize Lume client: {:?}", e);
+                log::error!("Failed to initialize Lume client: {:?}", e);
                 Err(e.into())
             }
         }
@@ -352,18 +385,6 @@ async fn main() {
                 // You might want to add a delay before retrying
                 // or handle this error differently
             }
-        }
-        match LumeClient::new() {
-            Ok(lume) => {
-                // Read SSH credentials from environment variables or use defaults
-                let username = env::var("LUME_SSH_USER").unwrap_or_else(|_| "lume".to_string());
-                let password = env::var("LUME_SSH_PASSWORD").unwrap_or_else(|_| "lume".to_string());
-                match run_script_on_vm(&lume, "cirun-runner", "touch /tmp/temp-cirun", &username, &password, 300, true).await {
-                    Ok(output) => println!("Script output:\n{}", output),
-                    Err(e) => eprintln!("Error: {}", e),
-                }
-            },
-            Err(e) => eprintln!("Failed to initialize Lume client: {:?}", e),
         }
 
         match client.get_command().await {
