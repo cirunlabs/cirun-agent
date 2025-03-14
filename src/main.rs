@@ -1,4 +1,5 @@
 mod lume;
+mod vm_provision;
 
 use clap::Parser;
 use reqwest::{Client, Error};
@@ -17,6 +18,7 @@ use std::path::Path;
 use std::env;
 use std::process::Command as StdCommand;
 use crate::lume::lume::LumeClient;
+use crate::vm_provision::run_script_on_vm;
 
 const CIRUN_BANNER: &str = r#"
        _                       _                    _
@@ -275,7 +277,10 @@ async fn main() {
     info!("Hostname: {}", agent_info.hostname);
     info!("OS: {} ({})", agent_info.os, agent_info.arch);
 
-    let client = CirunClient::new("http://localhost:8080/api/v1", &args.api_token, agent_info);
+    let default_api_url = "http://localhost:8080/api/v1";
+    let cirun_api_url = env::var("CIRUN_API_URL").unwrap_or_else(|_| default_api_url.to_string());
+    info!("Cirun API URL: {}", cirun_api_url);
+    let client = CirunClient::new(&cirun_api_url, &args.api_token, agent_info);
 
     loop {
         match LumeClient::new() {
@@ -299,6 +304,18 @@ async fn main() {
                 // You might want to add a delay before retrying
                 // or handle this error differently
             }
+        }
+        match LumeClient::new() {
+            Ok(lume) => {
+                // Read SSH credentials from environment variables or use defaults
+                let username = env::var("LUME_SSH_USER").unwrap_or_else(|_| "lume".to_string());
+                let password = env::var("LUME_SSH_PASSWORD").unwrap_or_else(|_| "lume".to_string());
+                match run_script_on_vm(&lume, "cirun-runner", "touch /tmp/temp-cirun", &username, &password, 300, true).await {
+                    Ok(output) => println!("Script output:\n{}", output),
+                    Err(e) => eprintln!("Error: {}", e),
+                }
+            },
+            Err(e) => eprintln!("Failed to initialize Lume client: {:?}", e),
         }
 
         match client.get_command().await {

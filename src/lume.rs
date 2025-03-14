@@ -1,9 +1,11 @@
 // lume.rs
 #![allow(dead_code)]
 pub mod lume {
+    use std::fmt;
     use reqwest::{Client, Error as ReqwestError};
     use serde::{Deserialize, Serialize};
     use std::time::Duration;
+    use serde::de::StdError;
 
     const DEFAULT_API_URL: &str = "http://localhost:3000/lume";
     const DEFAULT_TIMEOUT: u64 = 300; // 5 minutes
@@ -63,12 +65,32 @@ pub mod lume {
         pub disk_size: DiskSize,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub display: Option<String>,
+        #[serde(rename = "ipAddress", default)]
+        pub ip_address: Option<String>,
     }
 
     #[derive(Debug)]
     pub enum LumeError {
         RequestError(ReqwestError),
         ApiError(String),
+    }
+
+    impl fmt::Display for LumeError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                LumeError::RequestError(err) => write!(f, "Request error: {}", err),
+                LumeError::ApiError(msg) => write!(f, "API error: {}", msg),
+            }
+        }
+    }
+
+    impl StdError for LumeError {
+        fn source(&self) -> Option<&(dyn StdError + 'static)> {
+            match self {
+                LumeError::RequestError(err) => Some(err),
+                LumeError::ApiError(_) => None,
+            }
+        }
     }
 
     impl From<ReqwestError> for LumeError {
