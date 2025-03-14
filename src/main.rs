@@ -91,6 +91,45 @@ impl CirunClient {
         }
     }
 
+    async fn report_running_vms(&self) {
+        info!("Reporting running VMs to API");
+        match LumeClient::new() {
+            Ok(lume) => {
+                match lume.list_vms().await {
+                    Ok(vms) => {
+                        let running_vms: Vec<_> = vms.into_iter().filter(|vm| vm.state == "running").collect();
+
+                        let url = format!("{}/agent", self.base_url);
+                        let res = self.client
+                            .post(&url)
+                            .header("Authorization", format!("Bearer {}", self.api_token))
+                            .json(&json!({
+                                "agent": self.agent,
+                                "running_vms": running_vms.iter().map(|vm| {
+                                    json!({
+                                        "name": vm.name,
+                                        "os": vm.os,
+                                        "cpu": vm.cpu,
+                                        "memory": vm.memory,
+                                        "disk_size": vm.disk_size.total
+                                    })
+                                }).collect::<Vec<_>>()
+                            }))
+                            .send()
+                            .await;
+
+                        match res {
+                            Ok(_) => log::info!("Successfully sent running VMs to API"),
+                            Err(e) => log::error!("Failed to send running VMs: {}", e),
+                        }
+                    },
+                    Err(e) => log::error!("Failed to list VMs: {:?}", e),
+                }
+            },
+            Err(e) => log::error!("Failed to initialize Lume client: {:?}", e),
+        }
+    }
+
     async fn provision_runner(&self, runner_name: &str, provision_script: &str) -> Result<(), Box<dyn std::error::Error>> {
         match LumeClient::new() {
             Ok(lume) => {
@@ -153,7 +192,7 @@ impl CirunClient {
         }
     }
 
-    async fn get_command(&self) -> Result<ApiResponse, Error> {
+    async fn get_runner_to_provision(&self) -> Result<ApiResponse, Error> {
         let url = format!("{}/agent", self.base_url);
         info!("Fetching command from: {}", url);
         let request_data = json!({
@@ -175,7 +214,10 @@ impl CirunClient {
         if !json.runners.is_empty() {
             for runner in &json.runners {
                 match self.provision_runner(&runner.name, &runner.provision_script).await {
-                    Ok(_) => info!("Successfully provisioned runner: {}", runner.name),
+                    Ok(_) => {
+                        info!("Successfully provisioned runner: {}", runner.name)
+
+                    },
                     Err(e) => error!("Failed to provision runner {}: {}", runner.name, e),
                 }
             }
@@ -387,7 +429,8 @@ async fn main() {
             }
         }
 
-        match client.get_command().await {
+        client.report_running_vms().await;
+        match client.get_runner_to_provision().await {
             Ok(response) => {
                 if !response.command.is_empty() {
                     client.execute_command(&response.command).await;
