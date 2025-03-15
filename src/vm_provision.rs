@@ -19,7 +19,7 @@ pub async fn run_script_on_vm(
     timeout_seconds: u64,
     run_detached: bool
 ) -> Result<String, Box<dyn std::error::Error>> {
-    // Step 1: Get VM details and verify it exists
+    // Step 1: Get VM details and verify it does not exists
     info!("Getting details for VM: {}", vm_name);
     let vm = lume.get_vm(vm_name).await?;
     info!("Found VM: {} ({})", vm.name, vm.state);

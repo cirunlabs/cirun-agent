@@ -5,6 +5,8 @@ pub mod lume {
     use reqwest::{Client, Error as ReqwestError};
     use serde::{Deserialize, Serialize};
     use std::time::Duration;
+    use backon::{ExponentialBuilder, Retryable};
+    use log::warn;
     use serde::de::StdError;
 
     const DEFAULT_API_URL: &str = "http://127.0.0.1:3000/lume";
@@ -33,10 +35,13 @@ pub mod lume {
     #[derive(Debug, Serialize, Deserialize)]
     pub struct RunConfig {
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(rename = "noDisplay")]
         pub no_display: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(rename = "sharedDirectories")]
         pub shared_directories: Option<Vec<SharedDirectory>>,
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(rename = "recoveryMode")]
         pub recovery_mode: Option<bool>,
     }
 
@@ -153,15 +158,22 @@ pub mod lume {
                 request = request.json(&run_config);
             }
 
-            let response = request.send().await?;
+            log::info!("Sending request to start VM: {}", name);
 
-            if !response.status().is_success() {
-                let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-                return Err(LumeError::ApiError(format!("Failed to run VM: {}", error_text)));
+            let response = request.send().await?;
+            let status = response.status(); // Clone status before calling .text()
+            let response_text = response.text().await.unwrap_or_else(|_| "Failed to read response body".to_string());
+
+            log::info!("VM Run API Response: Status = {}, Body = {}", status, response_text);
+
+            if !status.is_success() { // Use the cloned status here
+                return Err(LumeError::ApiError(format!("Failed to run VM: {}", response_text)));
             }
 
+            log::info!("Successfully started VM: {}", name);
             Ok(())
         }
+
 
         pub async fn clone_vm(&self, source_name: &str, new_name: &str) -> Result<(), LumeError> {
             let url = format!("{}/vms/clone", self.base_url);
@@ -172,19 +184,36 @@ pub mod lume {
             };
 
             log::info!("Cloning VM {} to {}", source_name, new_name);
-            let response = self.client
-                .post(&url)
-                .json(&config)
-                .send()
-                .await?;
 
-            let status = response.status();
-            log::info!("Clone operation response status: {}", status);
-            if !response.status().is_success() {
-                log::info!("Cloning VM {} to {} FAILED", source_name, new_name);
-                let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-                return Err(LumeError::ApiError(format!("Failed to clone VM: {}", error_text)));
-            }
+            let send_clone_request = || async {
+                let response = self.client
+                    .post(&url)
+                    .json(&config)
+                    .send()
+                    .await
+                    .map_err(|e| LumeError::ApiError(format!("HTTP request failed: {:?}", e)))?;
+
+                let status = response.status();
+                log::info!("Clone operation response status: {}", status);
+
+                if !status.is_success() {
+                    let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+                    return Err(LumeError::ApiError(format!("Failed to clone VM: {}", error_text)));
+                }
+
+                Ok(())
+            };
+
+            // Retry logic with proper error conversion
+            send_clone_request
+                .retry(ExponentialBuilder::default().with_max_times(5)) // Retry max 5 times
+                .sleep(tokio::time::sleep)
+                .when(|e| matches!(e, LumeError::ApiError(_))) // Retry only on API errors
+                .notify(|err, dur| warn!("Retrying VM clone after {:?}: {:?}", dur, err))
+                .await
+                .map_err(|e| LumeError::ApiError(format!("Retry exhausted: {:?}", e)))?; // Convert final error to LumeError
+
+            log::info!("VM {} successfully cloned to {}", source_name, new_name);
             Ok(())
         }
 

@@ -6,7 +6,7 @@ use reqwest::{Client, Error};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::time::{sleep, Duration};
-use log::{info, error};
+use log::{info, error, warn};
 use env_logger;
 use uuid::Uuid;
 use std::fs;
@@ -52,7 +52,8 @@ struct AgentInfo {
 #[derive(Debug, Serialize, Deserialize)]
 struct ApiResponse {
     #[serde(default)]
-    runners: Vec<RunnerToProvision>,
+    runners_to_provision: Vec<RunnerToProvision>,
+    runners_to_delete: Vec<RunnerToDelete>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -63,6 +64,11 @@ struct RunnerToProvision {
     cpu: u32,
     memory: u32,
     disk: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RunnerToDelete {
+    name: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -133,13 +139,12 @@ impl CirunClient {
         match LumeClient::new() {
             Ok(lume) => {
                 // Check if VM exists by trying to get its details
-                let vm_exists = match lume.get_vm(runner_name).await {
-                    Ok(_) => true,
-                    Err(_) => false,
-                };
+                let vm_result = lume.get_vm(runner_name).await;
+                let vm_exists = vm_result.is_ok();
 
-                // If VM doesn't exist, try to clone it from the template
-                if !vm_exists {
+                let vm = if vm_exists {
+                    vm_result.unwrap() // VM exists, unwrap safely
+                } else {
                     info!("VM '{}' does not exist. Attempting to clone from template...", runner_name);
 
                     // Check if template exists
@@ -149,7 +154,7 @@ impl CirunClient {
                             match lume.clone_vm("cirun-runner-template", runner_name).await {
                                 Ok(_) => {
                                     info!("VM '{}' cloned successfully from template", runner_name);
-                                    // Continue with provisioning below
+                                    lume.get_vm(runner_name).await? // Get VM details after cloning
                                 },
                                 Err(e) => {
                                     error!("Failed to clone VM from template: {:?}", e);
@@ -163,8 +168,13 @@ impl CirunClient {
                             return Err("Template 'cirun-runner-template' not found. Cannot provision runner.".into());
                         }
                     }
-                } else {
-                    info!("VM '{}' already exists", runner_name);
+                };
+
+                info!("VM '{}' is now available", runner_name);
+
+                // If VM exists but is not stopped, skip provisioning
+                if vm.state != "stopped" {
+                    info!("VM '{}' exists and is not stopped. Skipping provisioning.", runner_name);
                     return Ok(());
                 }
 
@@ -194,6 +204,44 @@ impl CirunClient {
         }
     }
 
+    async fn delete_runner(&self, runner_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+        match LumeClient::new() {
+            Ok(lume) => {
+                info!("Attempting to delete runner VM: {}", runner_name);
+
+                // Check if VM exists by trying to get its details
+                match lume.get_vm(runner_name).await {
+                    Ok(vm) => {
+                        info!("Found VM '{}' with status: {}", runner_name, vm.state);
+
+                        // Delete the VM
+                        match lume.delete_vm(runner_name).await {
+                            Ok(_) => {
+                                info!("VM '{}' deleted successfully", runner_name);
+                                Ok(())
+                            },
+                            Err(e) => {
+                                error!("Failed to delete VM '{}': {:?}", runner_name, e);
+                                Err(format!("Failed to delete VM '{}': {:?}", runner_name, e).into())
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        warn!("VM '{}' not found or error retrieving VM details: {:?}", runner_name, e);
+                        // Consider this a success since the VM doesn't exist anyway
+                        info!("VM '{}' doesn't exist or can't be accessed - considering delete successful", runner_name);
+                        Ok(())
+                    }
+                }
+            },
+            Err(e) => {
+                error!("Failed to initialize Lume client: {:?}", e);
+                Err(e.into())
+            }
+        }
+    }
+
+
     async fn get_runner_to_provision(&self) -> Result<ApiResponse, Error> {
         let url = format!("{}/agent", self.base_url);
         info!("Fetching command from: {}", url);
@@ -212,14 +260,27 @@ impl CirunClient {
 
         // Handle any runners that need provisioning
         // Check if there are any runners to provision
-        if !json.runners.is_empty() {
-            for runner in &json.runners {
+        if !json.runners_to_provision.is_empty() {
+            for runner in &json.runners_to_provision {
                 match self.provision_runner(&runner.name, &runner.provision_script).await {
                     Ok(_) => {
                         info!("Successfully provisioned runner: {}", runner.name);
                         self.report_running_vms().await;
                     },
                     Err(e) => error!("Failed to provision runner {}: {}", runner.name, e),
+                }
+            }
+        }
+        // Handle any runners that need provisioning
+        // Check if there are any runners to provision
+        if !json.runners_to_delete.is_empty() {
+            for runner in &json.runners_to_delete {
+                match self.delete_runner(&runner.name).await {
+                    Ok(_) => {
+                        info!("Successfully deleted runner: {}", runner.name);
+                        self.report_running_vms().await;
+                    },
+                    Err(e) => error!("Failed to delete runner {}: {}", runner.name, e),
                 }
             }
         }
@@ -333,7 +394,7 @@ async fn main() {
         client.report_running_vms().await;
         match client.get_runner_to_provision().await {
             Ok(response) => {
-                info!("Runners to provision: {}", response.runners.len());
+                info!("Runners to provision: {}", response.runners_to_provision.len());
             }
             Err(e) => error!("Error fetching command: {}", e),
         }
