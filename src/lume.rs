@@ -8,8 +8,8 @@ pub mod lume {
     use serde::de::StdError;
 
     const DEFAULT_API_URL: &str = "http://127.0.0.1:3000/lume";
-    const CONNECT_TIMEOUT: u64 = 6000; // 5 minutes
-    const MAX_TIMEOUT: u64 = 5000; // 5 minutes
+    const CONNECT_TIMEOUT: u64 = 6000;
+    const MAX_TIMEOUT: u64 = 5000;
 
     #[derive(Debug, Serialize, Deserialize)]
     pub struct VmConfig {
@@ -113,11 +113,11 @@ pub mod lume {
 
         pub fn with_base_url(base_url: &str) -> Result<Self, LumeError> {
             let client = Client::builder()
-                .timeout(Duration::from_millis(MAX_TIMEOUT))         // 5 seconds
-                .connect_timeout(Duration::from_millis(CONNECT_TIMEOUT))  // 6 seconds
-                .pool_idle_timeout(Duration::from_secs(90))        // Keep connections alive
-                .pool_max_idle_per_host(10)                        // Connection pooling
-                .tcp_keepalive(Duration::from_secs(60))            // TCP keepalive
+                .timeout(Duration::from_secs(MAX_TIMEOUT))
+                .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT))
+                .pool_idle_timeout(Duration::from_secs(90))
+                .pool_max_idle_per_host(10)
+                .tcp_keepalive(Duration::from_secs(60))
                 .build()
                 .map_err(LumeError::from)?;
 
