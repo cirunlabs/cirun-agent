@@ -242,9 +242,9 @@ impl CirunClient {
     }
 
 
-    async fn get_runner_to_provision(&self) -> Result<ApiResponse, Error> {
+    async fn manage_runner_lifecyle(&self) -> Result<ApiResponse, Error> {
         let url = format!("{}/agent", self.base_url);
-        info!("Fetching command from: {}", url);
+        info!("Fetching runner provision/deletion data from: {}", url);
         let request_data = json!({
             "agent": self.agent,
         });
@@ -392,9 +392,10 @@ async fn main() {
         }
 
         client.report_running_vms().await;
-        match client.get_runner_to_provision().await {
+        match client.manage_runner_lifecyle().await {
             Ok(response) => {
-                info!("Runners to provision: {}", response.runners_to_provision.len());
+                info!("Attempted runners to provision: {}", response.runners_to_provision.len());
+                info!("Attempted runners to delete: {}", response.runners_to_delete.len());
             }
             Err(e) => error!("Error fetching command: {}", e),
         }
