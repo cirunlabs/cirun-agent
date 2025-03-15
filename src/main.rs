@@ -59,6 +59,10 @@ struct ApiResponse {
 struct RunnerToProvision {
     name: String,
     provision_script: String,
+    os: String,
+    cpu: u32,
+    memory: u32,
+    disk: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -114,14 +118,14 @@ impl CirunClient {
                             .await;
 
                         match res {
-                            Ok(_) => log::info!("Successfully sent running VMs to API"),
-                            Err(e) => log::error!("Failed to send running VMs: {}", e),
+                            Ok(_) => info!("Successfully sent running VMs to API"),
+                            Err(e) => error!("Failed to send running VMs: {}", e),
                         }
                     },
-                    Err(e) => log::error!("Failed to list VMs: {:?}", e),
+                    Err(e) => error!("Failed to list VMs: {:?}", e),
                 }
             },
-            Err(e) => log::error!("Failed to initialize Lume client: {:?}", e),
+            Err(e) => error!("Failed to initialize Lume client: {:?}", e),
         }
     }
 
@@ -136,7 +140,7 @@ impl CirunClient {
 
                 // If VM doesn't exist, try to clone it from the template
                 if !vm_exists {
-                    log::info!("VM '{}' does not exist. Attempting to clone from template...", runner_name);
+                    info!("VM '{}' does not exist. Attempting to clone from template...", runner_name);
 
                     // Check if template exists
                     match lume.get_vm("cirun-runner-template").await {
@@ -144,44 +148,47 @@ impl CirunClient {
                             // Template exists, clone it
                             match lume.clone_vm("cirun-runner-template", runner_name).await {
                                 Ok(_) => {
-                                    log::info!("VM '{}' cloned successfully from template", runner_name);
+                                    info!("VM '{}' cloned successfully from template", runner_name);
                                     // Continue with provisioning below
                                 },
                                 Err(e) => {
-                                    log::error!("Failed to clone VM from template: {:?}", e);
+                                    error!("Failed to clone VM from template: {:?}", e);
                                     return Err(format!("Failed to clone VM from template: {:?}", e).into());
                                 }
                             }
                         },
                         Err(e) => {
                             // Template doesn't exist
-                            log::error!("Template 'cirun-runner-template' not found: {:?}", e);
+                            error!("Template 'cirun-runner-template' not found: {:?}", e);
                             return Err("Template 'cirun-runner-template' not found. Cannot provision runner.".into());
                         }
                     }
+                } else {
+                    info!("VM '{}' already exists", runner_name);
+                    return Ok(());
                 }
 
                 // Read SSH credentials from environment variables or use defaults
                 let username = env::var("LUME_SSH_USER").unwrap_or_else(|_| "lume".to_string());
                 let password = env::var("LUME_SSH_PASSWORD").unwrap_or_else(|_| "lume".to_string());
 
-                log::info!("Provisioning runner: {}", runner_name);
-                log::info!("Running provision script on VM");
+                info!("Provisioning runner: {}", runner_name);
+                info!("Running provision script on VM");
 
                 match run_script_on_vm(&lume, runner_name, provision_script, &username, &password, 180, true).await {
                     Ok(output) => {
-                        log::info!("Runner provisioning completed successfully");
-                        log::info!("Script output: {}", output);
+                        info!("Runner provisioning completed successfully");
+                        info!("Script output: {}", output);
                         Ok(())
                     },
                     Err(e) => {
-                        log::error!("Failed to provision runner: {}", e);
+                        error!("Failed to provision runner: {}", e);
                         Err(e.into())
                     }
                 }
             },
             Err(e) => {
-                log::error!("Failed to initialize Lume client: {:?}", e);
+                error!("Failed to initialize Lume client: {:?}", e);
                 Err(e.into())
             }
         }
