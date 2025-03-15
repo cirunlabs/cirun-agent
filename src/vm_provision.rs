@@ -4,8 +4,11 @@ use std::time::{Duration, Instant};
 use log::{info, error, warn};
 use tempfile::NamedTempFile;
 use tokio::time::sleep;
-use crate::lume::lume::LumeClient;
+use crate::lume::lume::{LumeClient, RunConfig};
 use std::fs::{File, remove_file};
+
+use backon::{ExponentialBuilder, Retryable};
+use anyhow::Result;
 
 pub async fn run_script_on_vm(
     lume: &LumeClient,
@@ -21,10 +24,26 @@ pub async fn run_script_on_vm(
     let vm = lume.get_vm(vm_name).await?;
     info!("Found VM: {} ({})", vm.name, vm.state);
 
-    // Step 2: If the VM is not running, try to start it
+    // Step 2: If the VM is not running, try to start it with retries
     if vm.state != "running" {
         info!("VM is not running. Current state: {}. Attempting to start...", vm.state);
-        lume.run_vm(vm_name, None).await?;
+
+        let start_vm = || async {
+            let run_config = RunConfig {
+                no_display: Some(true),
+                shared_directories: None,
+                recovery_mode: None,
+            };
+            lume.run_vm(vm_name, Some(run_config)).await.map_err(|e| anyhow::anyhow!("Failed to start VM: {:?}", e))
+        };
+
+        start_vm
+            .retry(ExponentialBuilder::default())
+            .sleep(tokio::time::sleep)
+            .when(|e| e.to_string().contains("Failed to start VM"))
+            .notify(|err, dur| warn!("Retrying VM start after {:?}: {:?}", dur, err))
+            .await?;
+
         info!("Start command sent successfully");
     }
 
@@ -51,105 +70,117 @@ pub async fn run_script_on_vm(
         "-o", "ConnectTimeout=10",
     ];
 
-    // NEW: Test SSH connection before proceeding
+    // Step 7: Test SSH connection with retries
     info!("Testing SSH connection to VM");
-    let test_output = Command::new("sshpass")
-        .arg("-f")
-        .arg(&password_file_path)
-        .arg("ssh")
-        .args(&ssh_options)
-        .arg(format!("{}@{}", username, ip_address))
-        .arg("echo 'SSH connection test successful'")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()?;
+    let ssh_test_result = || async {
+        let output = Command::new("sshpass")
+            .arg("-f").arg(&password_file_path)
+            .arg("ssh")
+            .args(&ssh_options)
+            .arg(format!("{}@{}", username, ip_address))
+            .arg("echo 'SSH connection test successful'")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()?;
 
-    let test_stdout = String::from_utf8_lossy(&test_output.stdout).to_string();
-    let test_stderr = String::from_utf8_lossy(&test_output.stderr).to_string();
+        if !output.status.success() {
+            Err(anyhow::anyhow!("SSH connection failed: {}", String::from_utf8_lossy(&output.stderr)))
+        } else {
+            Ok(())
+        }
+    };
 
-    if !test_output.status.success() {
-        clean_up_password_file(&password_file_path);
-        error!("SSH connection test failed: {}", test_stderr);
-        return Err(format!("Could not establish SSH connection to VM: {}. Make sure username and password are correct.", test_stderr).into());
-    }
+    ssh_test_result
+        .retry(ExponentialBuilder::default())
+        .sleep(tokio::time::sleep)
+        .when(|e| e.to_string().contains("SSH connection failed"))
+        .notify(|err, dur| warn!("Retrying SSH connection after {:?}: {:?}", dur, err))
+        .await?;
 
-    info!("✔ SSH connection test successful: {}", test_stdout.trim());
+    info!("✔ SSH connection successful");
 
-    // Step 7: Copy the script to the VM using sshpass with password file
+    // Step 8: Copy the script to the VM using sshpass with retries
     let remote_script_path = format!("/tmp/script_{}.sh", Instant::now().elapsed().as_secs());
     info!("Copying script to VM at {}", remote_script_path);
 
-    let scp_output = Command::new("sshpass")
-        .arg("-f")
-        .arg(&password_file_path)
-        .arg("scp")
-        .args(&ssh_options)
-        .arg(temp_file_path)
-        .arg(format!("{}@{}:{}", username, ip_address, remote_script_path))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()?;
-
-    if !scp_output.status.success() {
-        let scp_stderr = String::from_utf8_lossy(&scp_output.stderr).to_string();
-        // Clean up password file before returning error
-        clean_up_password_file(&password_file_path);
-        error!("SCP failed: {}", scp_stderr);
-        return Err(format!("Failed to copy script to VM: exit code {:?}. Error: {}",
-                           scp_output.status.code(), scp_stderr).into());
-    }
-
-    // Step 8: Execute the script
-    let output = if run_detached {
-        // Execute in non-interactive mode with no TTY (for long-running scripts)
-        info!("Executing script on VM in detached mode");
-        Command::new("sshpass")
-            .arg("-f")
-            .arg(&password_file_path)
-            .arg("ssh")
+    let scp_transfer = || async {
+        let output = Command::new("sshpass")
+            .arg("-f").arg(&password_file_path)
+            .arg("scp")
             .args(&ssh_options)
-            // Add options to ensure no TTY is allocated
-            .arg("-T")  // Disable pseudo-terminal allocation
-            .arg("-n")  // Redirect stdin from /dev/null
-            .arg(format!("{}@{}", username, ip_address))
-            // Run the script in the background and redirect output to files
-            .arg(format!("chmod +x {} && nohup {} > /tmp/script_stdout.log 2> /tmp/script_stderr.log & echo $!",
-                         remote_script_path, remote_script_path))
+            .arg(temp_file_path)
+            .arg(format!("{}@{}:{}", username, ip_address, remote_script_path))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()?
-    } else {
-        // Execute in normal mode (for scripts where we want to wait for completion)
-        info!("Executing script on VM and waiting for completion");
-        Command::new("sshpass")
-            .arg("-f")
-            .arg(&password_file_path)
-            .arg("ssh")
-            .args(&ssh_options)
-            .arg(format!("{}@{}", username, ip_address))
-            .arg(format!("chmod +x {} && {}", remote_script_path, remote_script_path))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()?
+            .output()?;
+
+        if !output.status.success() {
+            Err(anyhow::anyhow!("SCP failed: {}", String::from_utf8_lossy(&output.stderr)))
+        } else {
+            Ok(())
+        }
     };
 
-    // Clean up password file
+    scp_transfer
+        .retry(ExponentialBuilder::default())
+        .sleep(tokio::time::sleep)
+        .when(|e| e.to_string().contains("SCP failed"))
+        .notify(|err, dur| warn!("Retrying SCP transfer after {:?}: {:?}", dur, err))
+        .await?;
+
+    info!("✔ SCP transfer successful");
+
+    // Step 9: Execute the script on the VM with retries
+    let execute_script = || async {
+        let output = if run_detached {
+            // Execute in detached mode
+            info!("Executing script on VM in detached mode");
+            Command::new("sshpass")
+                .arg("-f").arg(&password_file_path)
+                .arg("ssh")
+                .args(&ssh_options)
+                .arg(format!("{}@{}", username, ip_address))
+                .arg(format!("chmod +x {} && nohup {} > /tmp/script_stdout.log 2> /tmp/script_stderr.log & echo $!",
+                             remote_script_path, remote_script_path))
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()?
+        } else {
+            // Execute in normal mode
+            info!("Executing script on VM and waiting for completion");
+            Command::new("sshpass")
+                .arg("-f").arg(&password_file_path)
+                .arg("ssh")
+                .args(&ssh_options)
+                .arg(format!("{}@{}", username, ip_address))
+                .arg(format!("chmod +x {} && {}", remote_script_path, remote_script_path))
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()?
+        };
+
+        if !output.status.success() {
+            Err(anyhow::anyhow!("Script execution failed: {}", String::from_utf8_lossy(&output.stderr)))
+        } else {
+            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        }
+    };
+
+    let script_output = execute_script
+        .retry(ExponentialBuilder::default())
+        .sleep(tokio::time::sleep)
+        .when(|e| e.to_string().contains("Script execution failed"))
+        .notify(|err, dur| warn!("Retrying script execution after {:?}: {:?}", dur, err))
+        .await?;
+
+    // Step 10: Clean up password file
     clean_up_password_file(&password_file_path);
 
-    // Step 9: Return the output
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-    info!("Script execution completed with exit code: {:?}", output.status.code());
-
-    if !output.status.success() {
-        warn!("Script execution stderr: {}", stderr);
-        return Err(format!("Script execution failed with exit code {:?}. Error: {}",
-                           output.status.code(), stderr).into());
-    }
-
-    Ok(stdout)
+    // Step 11: Return the output
+    info!("Script execution completed successfully.");
+    Ok(script_output)
 }
+
 
 // Helper function to create a temporary file containing the password
 fn create_password_file(password: &str) -> Result<String, Box<dyn std::error::Error>> {

@@ -15,3 +15,5 @@ uuid = { version = "1.16.0", features = ["v4"] }
 thiserror = "2.0.12"
 url = "2.5.4"
 tempfile = "3.18.0"
+backon = "1.4.0"
+anyhow = "1.0.97"
