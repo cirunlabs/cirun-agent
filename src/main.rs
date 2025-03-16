@@ -362,7 +362,7 @@ async fn main() {
     info!("Hostname: {}", agent_info.hostname);
     info!("OS: {} ({})", agent_info.os, agent_info.arch);
 
-    let default_api_url = "http://localhost:8080/api/v1";
+    let default_api_url = "https://api.cirun.io/api/v1";
     let cirun_api_url = env::var("CIRUN_API_URL").unwrap_or_else(|_| default_api_url.to_string());
     info!("Cirun API URL: {}", cirun_api_url);
     let client = CirunClient::new(&cirun_api_url, &args.api_token, agent_info);

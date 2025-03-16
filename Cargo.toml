@@ -2,6 +2,14 @@
 name = "cirun-agent"
 version = "0.1.0"
 edition = "2021"
+repository = "https://github.com/aktechlabs/cirun-agent"
+authors = ["Amit Kumar <dtu.amit@gmail.com>"]
+
+[package.metadata.wix]
+upgrade-guid = "8093D5D1-A757-4C3D-93AD-631CAA3BCC44"
+path-guid = "77BB9593-9CF5-44B4-B000-5CDA6D9D1282"
+license = false
+eula = false
 
 [dependencies]
 clap = { version = "4.5.32", features = ["derive"] }
@@ -17,3 +25,8 @@ url = "2.5.4"
 tempfile = "3.18.0"
 backon = "1.4.0"
 anyhow = "1.0.97"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
