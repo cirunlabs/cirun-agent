@@ -96,6 +96,18 @@ impl CirunClient {
         }
     }
 
+    // Helper method to create a request builder with common headers
+    fn create_request(&self, method: reqwest::Method, url: &str) -> reqwest::RequestBuilder {
+        let request_id = Uuid::new_v4().to_string();
+        info!("Creating request with ID: {}", request_id);
+
+        self.client
+            .request(method, url)
+            .header("Authorization", format!("Bearer {}", self.api_token))
+            .header("X-Request-ID", request_id)
+            .header("X-Agent-ID", &self.agent.id)
+    }
+
     async fn report_running_vms(&self) {
         info!("Reporting running VMs to API");
         match LumeClient::new() {
@@ -103,11 +115,10 @@ impl CirunClient {
                 match lume.list_vms().await {
                     Ok(vms) => {
                         let running_vms: Vec<_> = vms.into_iter().filter(|vm| vm.state == "running").collect();
-
                         let url = format!("{}/agent", self.base_url);
-                        let res = self.client
-                            .post(&url)
-                            .header("Authorization", format!("Bearer {}", self.api_token))
+
+                        // Use the helper method instead of direct client access
+                        let res = self.create_request(reqwest::Method::POST, &url)
                             .json(&json!({
                                 "agent": self.agent,
                                 "running_vms": running_vms.iter().map(|vm| {
@@ -124,7 +135,15 @@ impl CirunClient {
                             .await;
 
                         match res {
-                            Ok(_) => info!("Successfully sent running VMs to API"),
+                            Ok(response) => {
+                                let status = response.status();
+                                info!("API response status: {}", status);
+                                if let Some(req_id) = response.headers().get("X-Request-ID") {
+                                    if let Ok(id) = req_id.to_str() {
+                                        info!("Response received with request ID: {}", id);
+                                    }
+                                }
+                            },
                             Err(e) => error!("Failed to send running VMs: {}", e),
                         }
                     },
@@ -241,25 +260,24 @@ impl CirunClient {
         }
     }
 
-
     async fn manage_runner_lifecycle(&self) -> Result<ApiResponse, Error> {
         let url = format!("{}/agent", self.base_url);
         info!("Fetching runner provision/deletion data from: {}", url);
+
         let request_data = json!({
             "agent": self.agent,
         });
-        let response = self
-            .client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", self.api_token))
+
+        // Use the helper method instead of direct client access
+        let response = self.create_request(reqwest::Method::GET, &url)
             .json(&request_data)
             .send()
             .await?;
-        info!("Response: {}", response.status());
+
+        info!("Response status: {}", response.status());
         let json: ApiResponse = response.json().await?;
 
         // Handle any runners that need provisioning
-        // Check if there are any runners to provision
         if !json.runners_to_provision.is_empty() {
             for runner in &json.runners_to_provision {
                 match self.provision_runner(&runner.name, &runner.provision_script).await {
@@ -271,8 +289,8 @@ impl CirunClient {
                 }
             }
         }
-        // Handle any runners that need provisioning
-        // Check if there are any runners to provision
+
+        // Handle any runners that need deletion
         if !json.runners_to_delete.is_empty() {
             for runner in &json.runners_to_delete {
                 match self.delete_runner(&runner.name).await {
@@ -284,6 +302,7 @@ impl CirunClient {
                 }
             }
         }
+
         Ok(json)
     }
 }
@@ -368,6 +387,30 @@ async fn main() {
     let cirun_api_url = env::var("CIRUN_API_URL").unwrap_or_else(|_| default_api_url.to_string());
     info!("Cirun API URL: {}", cirun_api_url);
     let client = CirunClient::new(&cirun_api_url, &args.api_token, agent_info);
+
+    // Check Lume connectivity before entering the main loop
+    info!("Checking Lume connectivity...");
+    match LumeClient::new() {
+        Ok(lume) => {
+            match lume.list_vms().await {
+                Ok(vms) => {
+                    info!("✅ Successfully connected to Lume. Found {} VMs", vms.len());
+                    for vm in vms {
+                        info!("- {} ({}, {}, CPU: {}, Memory: {}, Disk: {})",
+                             vm.name, vm.state, vm.os, vm.cpu, vm.memory, vm.disk_size.total);
+                    }
+                },
+                Err(e) => {
+                    error!("❌ Failed to connect to Lume API: {:?}", e);
+                    error!("Agent will continue but VM operations will likely fail");
+                }
+            }
+        },
+        Err(e) => {
+            error!("❌ Failed to initialize Lume client: {:?}", e);
+            error!("Agent will continue but VM operations will likely fail");
+        }
+    }
 
     loop {
         match LumeClient::new() {
