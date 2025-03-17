@@ -204,7 +204,7 @@ impl CirunClient {
                 info!("Provisioning runner: {}", runner_name);
                 info!("Running provision script on VM");
 
-                match run_script_on_vm(&lume, runner_name, provision_script, &username, &password, 180, true).await {
+                match run_script_on_vm(&lume, runner_name, provision_script, &username, &password, 60, true).await {
                     Ok(output) => {
                         info!("Runner provisioning completed successfully");
                         info!("Script output: {}", output);
@@ -277,19 +277,6 @@ impl CirunClient {
         info!("Response status: {}", response.status());
         let json: ApiResponse = response.json().await?;
 
-        // Handle any runners that need provisioning
-        if !json.runners_to_provision.is_empty() {
-            for runner in &json.runners_to_provision {
-                match self.provision_runner(&runner.name, &runner.provision_script).await {
-                    Ok(_) => {
-                        info!("Successfully provisioned runner: {}", runner.name);
-                        self.report_running_vms().await;
-                    },
-                    Err(e) => error!("Failed to provision runner {}: {}", runner.name, e),
-                }
-            }
-        }
-
         // Handle any runners that need deletion
         if !json.runners_to_delete.is_empty() {
             for runner in &json.runners_to_delete {
@@ -303,6 +290,18 @@ impl CirunClient {
             }
         }
 
+        // Handle any runners that need provisioning
+        if !json.runners_to_provision.is_empty() {
+            for runner in &json.runners_to_provision {
+                match self.provision_runner(&runner.name, &runner.provision_script).await {
+                    Ok(_) => {
+                        info!("Successfully provisioned runner: {}", runner.name);
+                        self.report_running_vms().await;
+                    },
+                    Err(e) => error!("Failed to provision runner {}: {}", runner.name, e),
+                }
+            }
+        }
         Ok(json)
     }
 }
