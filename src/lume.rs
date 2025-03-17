@@ -118,6 +118,7 @@ pub mod lume {
 
         pub fn with_base_url(base_url: &str) -> Result<Self, LumeError> {
             let client = Client::builder()
+                .http1_only()
                 .timeout(Duration::from_secs(MAX_TIMEOUT))
                 .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT))
                 .pool_idle_timeout(Duration::from_secs(90))
@@ -220,16 +221,37 @@ pub mod lume {
         pub async fn delete_vm(&self, name: &str) -> Result<(), LumeError> {
             let url = format!("{}/vms/{}", self.base_url, name);
 
-            let response = self.client
-                .delete(&url)
-                .send()
-                .await?;
+            log::info!("Deleting VM {}", name);
 
-            if !response.status().is_success() {
-                let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-                return Err(LumeError::ApiError(format!("Failed to delete VM: {}", error_text)));
-            }
+            let send_delete_request = || async {
+                let response = self.client
+                    .delete(&url)
+                    .send()
+                    .await
+                    .map_err(|e| LumeError::ApiError(format!("HTTP request failed: {:?}", e)))?;
 
+                let status = response.status();
+                let response_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+
+                log::info!("Delete operation response status: {}", status);
+                log::info!("Delete operation response body: {}", response_text);
+
+                if !status.is_success() {
+                    return Err(LumeError::ApiError(format!("Failed to delete VM: {}", response_text)));
+                }
+                Ok(())
+            };
+
+            // Retry logic with proper error conversion
+            send_delete_request
+                .retry(ExponentialBuilder::default().with_max_times(5)) // Retry max 5 times
+                .sleep(tokio::time::sleep)
+                .when(|e| matches!(e, LumeError::ApiError(_))) // Retry only on API errors
+                .notify(|err, dur| warn!("Retrying VM deletion after {:?}: {:?}", dur, err))
+                .await
+                .map_err(|e| LumeError::ApiError(format!("Retry exhausted: {:?}", e)))?; // Convert final error to LumeError
+
+            log::info!("VM {} successfully deleted", name);
             Ok(())
         }
 
