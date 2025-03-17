@@ -204,7 +204,7 @@ impl CirunClient {
                 info!("Provisioning runner: {}", runner_name);
                 info!("Running provision script on VM");
 
-                match run_script_on_vm(&lume, runner_name, provision_script, &username, &password, 60, true).await {
+                match run_script_on_vm(&lume, runner_name, provision_script, &username, &password, 20, true).await {
                     Ok(output) => {
                         info!("Runner provisioning completed successfully");
                         info!("Script output: {}", output);
