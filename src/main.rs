@@ -355,6 +355,8 @@ async fn main() {
     env_logger::init();
     println!("{}", CIRUN_BANNER);
     let args = Args::parse();
+    let version = env!("CARGO_PKG_VERSION");
+    info!("Cirun Agent version: {}", version);
 
     // Get or generate a persistent agent information
     let agent_info = get_agent_info(&args.id_file);
