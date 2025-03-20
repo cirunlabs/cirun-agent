@@ -15,3 +15,5 @@ targets = ["aarch64-apple-darwin", "aarch64-pc-windows-msvc", "x86_64-apple-darw
 install-path = "CARGO_HOME"
 # Whether to install an updater program
 install-updater = false
+# Which actions to run on pull requests
+pr-run-mode = "upload"
