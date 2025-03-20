@@ -5,12 +5,6 @@ edition = "2021"
 repository = "https://github.com/aktechlabs/cirun-agent"
 authors = ["Amit Kumar <dtu.amit@gmail.com>"]
 
-[package.metadata.wix]
-upgrade-guid = "8093D5D1-A757-4C3D-93AD-631CAA3BCC44"
-path-guid = "77BB9593-9CF5-44B4-B000-5CDA6D9D1282"
-license = false
-eula = false
-
 [dependencies]
 clap = { version = "4.5.32", features = ["derive"] }
 env_logger = "0.11.7"

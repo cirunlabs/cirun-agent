@@ -116,6 +116,11 @@ pub mod lume {
             Self::with_base_url(DEFAULT_API_URL)
         }
 
+        // Get the base URL of the Lume API
+        pub fn get_base_url(&self) -> &str {
+            &self.base_url
+        }
+
         pub fn with_base_url(base_url: &str) -> Result<Self, LumeError> {
             let client = Client::builder()
                 .http1_only()
