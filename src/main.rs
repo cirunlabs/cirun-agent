@@ -7,17 +7,19 @@ use reqwest::{Client, Error};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::time::{sleep, Duration};
-use log::{info, error, warn};
+use log::{info, error, warn, debug};
 use env_logger;
 use uuid::Uuid;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::env;
 use std::process::Command as StdCommand;
 use crate::lume::lume::LumeClient;
 use crate::vm_provision::run_script_on_vm;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::time::SystemTime;
+use crate::lume_setup::cleanup_log_files;
 
 const CIRUN_BANNER: &str = r#"
        _                       _                    _
@@ -676,8 +678,8 @@ impl CirunClient {
                 }
 
                 // Read SSH credentials from environment variables or use defaults
-                let username = env::var("LUME_SSH_USER").unwrap_or_else(|_| "lume".to_string());
-                let password = env::var("LUME_SSH_PASSWORD").unwrap_or_else(|_| "lume".to_string());
+                let username = env::var("LUME_SSH_USER").unwrap_or_else(|_| "cirun".to_string());
+                let password = env::var("LUME_SSH_PASSWORD").unwrap_or_else(|_| "cirun".to_string());
 
                 info!("Provisioning runner: {}", runner_name);
                 info!("Running provision script on VM");
@@ -765,6 +767,7 @@ impl CirunClient {
                         info!("✅ Successfully deleted runner: {}", runner.name);
                         self.report_running_vms().await;
                     },
+
                     Err(e) => error!("❌ Failed to delete runner {}: {}", runner.name, e),
                 }
             }
@@ -907,6 +910,12 @@ async fn main() {
         }
     }
 
+    // Set up log cleanup parameters
+    let home_dir = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let log_dir = PathBuf::from(&home_dir).join(".lume/logs");
+    let mut last_cleanup = SystemTime::now();
+    let cleanup_interval = Duration::from_secs(24 * 60 * 60); // Daily log cleanup
+
     // Main loop
     loop {
         match client.manage_runner_lifecycle().await {
@@ -919,6 +928,19 @@ async fn main() {
 
         // Report running VMs after all operations
         client.report_running_vms().await;
+
+        // Check if it's time to clean up logs
+        if let Ok(duration) = SystemTime::now().duration_since(last_cleanup) {
+            if duration >= cleanup_interval {
+                match cleanup_log_files(&log_dir, 7, 100) { // Keep logs for 7 days, rotate at 100MB
+                    Ok(_) => {
+                        last_cleanup = SystemTime::now();
+                        debug!("Updated last cleanup time: {:?}", last_cleanup);
+                    },
+                    Err(e) => error!("Failed to clean up logs: {}", e),
+                }
+            }
+        }
 
         sleep(Duration::from_secs(args.interval)).await;
     }
