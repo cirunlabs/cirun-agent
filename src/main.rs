@@ -1,5 +1,6 @@
 mod lume;
 mod vm_provision;
+mod lume_setup;
 
 use clap::Parser;
 use reqwest::{Client, Error};
@@ -872,6 +873,7 @@ async fn main() {
     let client = CirunClient::new(&cirun_api_url, &args.api_token, agent_info);
 
     // Check Lume connectivity before entering the main loop
+    lume_setup::download_and_run_lume().await;
     info!("Checking Lume connectivity...");
     match LumeClient::new() {
         Ok(lume) => {
