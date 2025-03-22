@@ -1,5 +1,6 @@
 mod lume;
 mod vm_provision;
+mod lume_setup;
 
 use clap::Parser;
 use reqwest::{Client, Error};
@@ -36,12 +37,16 @@ struct Args {
     api_token: String,
 
     /// Polling interval in seconds
-    #[arg(short, long, default_value_t = 10)]
+    #[arg(short, long, default_value_t = 5)]
     interval: u64,
 
     /// Agent ID file path (optional)
     #[arg(short = 'f', long, default_value = ".agent_id")]
     id_file: String,
+
+    /// Enable verbose logging
+    #[arg(short, long)]
+    verbose: bool,
 }
 
 // Structs for agent and API data
@@ -854,9 +859,15 @@ impl CirunClient {
 
 #[tokio::main]
 async fn main() {
-    env_logger::init();
     println!("{}", CIRUN_BANNER);
     let args = Args::parse();
+    // Initialize logger with the appropriate level
+    if args.verbose {
+        env::set_var("RUST_LOG", "debug");
+    } else {
+        env::set_var("RUST_LOG", "info");
+    }
+    env_logger::init();
     let version = env!("CARGO_PKG_VERSION");
     info!("Cirun Agent version: {}", version);
 
@@ -872,6 +883,7 @@ async fn main() {
     let client = CirunClient::new(&cirun_api_url, &args.api_token, agent_info);
 
     // Check Lume connectivity before entering the main loop
+    lume_setup::download_and_run_lume().await;
     info!("Checking Lume connectivity...");
     match LumeClient::new() {
         Ok(lume) => {

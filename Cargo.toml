@@ -19,6 +19,9 @@ url = "2.5.4"
 tempfile = "3.18.0"
 backon = "1.4.0"
 anyhow = "1.0.97"
+flate2 = "1.1.0"
+tar = "0.4.44"
+walkdir = "2.5.0"
 
 # The profile that 'dist' will build with
 [profile.dist]
