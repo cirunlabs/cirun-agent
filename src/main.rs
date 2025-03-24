@@ -375,7 +375,10 @@ impl CirunClient {
                 // Prepare the pull request data
                 let mut pull_data = json!({
                     "image": image_name,
-                    "name": vm_name
+                    "name": vm_name,
+                    // caching is a problem for large images
+                    // until this is fixed: https://github.com/trycua/cua/issues/60
+                    "noCache": true,
                 });
 
                 // Add optional parameters if present
