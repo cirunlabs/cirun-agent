@@ -13,6 +13,7 @@
 [![macOS](https://img.shields.io/badge/macos-%23000000.svg?style=for-the-badge&logo=apple&logoColor=white)](#)
 [![Rust](https://img.shields.io/badge/rust-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT-%23yellow.svg?style=for-the-badge)](https://opensource.org/licenses/MIT)
+[![Documentation](https://img.shields.io/badge/docs-cirun-%230075A8.svg?style=for-the-badge)](https://docs.cirun.io/on-prem)
 </div>
 
 A robust Rust agent for provisioning and managing CI/CD runners through the Cirun platform, offering automated VM lifecycle management with Lume virtualization.
@@ -27,6 +28,12 @@ A robust Rust agent for provisioning and managing CI/CD runners through the Ciru
 - **Environment Detection**: Auto-detects system information and capabilities
 
 ## 📦 Installation
+
+### Using binary (recommended)
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/aktechlabs/cirun-agent/releases/download/v0.2.7/cirun-agent-installer.sh | sh
+```
 
 ### Using Cargo
 
@@ -44,12 +51,7 @@ cargo build --release
 
 ## 🚀 Quick Start
 
-1. Obtain an API token from the [Cirun platform](https://cirun.io)
-2. Run the agent:
-
-```bash
-cirun-agent --api-token YOUR_API_TOKEN
-```
+Checkout docs for quick start guide: https://docs.cirun.io/on-prem
 
 ## ⚙️ Configuration
 
@@ -66,9 +68,15 @@ cirun-agent --api-token YOUR_API_TOKEN
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `CIRUN_API_URL` | Base URL for Cirun API | https://api.cirun.io/api/v1 |
-| `LUME_SSH_USER` | Username for SSH connections to VMs | lume |
-| `LUME_SSH_PASSWORD` | Password for SSH connections to VMs | lume |
+| `LUME_SSH_USER` | Username for SSH connections to VMs | cirun |
+| `LUME_SSH_PASSWORD` | Password for SSH connections to VMs | cirun |
 | `HOSTNAME` | Override system hostname detection | (System hostname) |
+
+## 🔌 Lume Virtualization
+
+Cirun-agent relies on Lume for VM provisioning and management. Lume is a lightweight virtualization platform that enables efficient cloning and management of virtual machines.
+
+> **Note**: The cirun-agent automatically manages the Lume process, so there's no need to install or configure Lume separately. The agent handles all interactions with Lume internally.
 
 ## 💡 Usage Scenarios
 
@@ -125,15 +133,27 @@ Enable detailed logs by setting the `RUST_LOG` environment variable:
 RUST_LOG=debug cirun-agent --api-token YOUR_API_TOKEN
 ```
 
-### Common Issues
 
-- **Failed to connect to Lume API**: Ensure the Lume service is running and accessible
-- **VM provisioning failures**: Check that the `cirun-runner-template` VM exists and is in a stopped state
-- **API connection errors**: Verify your network connection and API token validity
+## 📚 Documentation
+
+For comprehensive documentation about Cirun and the on-premises deployment options, visit:
+- [Cirun Documentation](https://docs.cirun.io/)
+- [On-Premises Guide](https://docs.cirun.io/on-prem)
+
+## 💬 Support
+
+- **Slack**: [slack.cirun.io](https://slack.cirun.io/)
+- **Email**: amit@cirun.io
 
 ## 📜 License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
+
+## 🚢 Release Process
+
+- Update the version in Cargo.toml
+- Make sure all changes are staged for commit
+- Run the release script: `./release.sh`
 
 ## 🤝 Contributing
 
