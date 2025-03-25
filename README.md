@@ -32,7 +32,7 @@ A robust Rust agent for provisioning and managing CI/CD runners through the Ciru
 ### Using binary (recommended)
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/aktechlabs/cirun-agent/releases/download/v0.2.8/cirun-agent-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/cirunlabs/cirun-agent/refs/heads/main/install.sh | sh
 ```
 
 ### Using Cargo
