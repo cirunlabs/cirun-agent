@@ -1,25 +1,24 @@
 mod lume;
 mod vm_provision;
-mod lume_setup;
 
+use crate::lume::client::LumeClient;
+use crate::lume::setup::cleanup_log_files;
+use crate::lume::{
+    check_template_exists, create_template, find_matching_template, generate_template_name,
+};
+use crate::vm_provision::run_script_on_vm;
 use clap::Parser;
+use log::{debug, error, info, warn};
 use reqwest::{Client, Error};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::time::{sleep, Duration};
-use log::{info, error, warn, debug};
-use env_logger;
-use uuid::Uuid;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::env;
 use std::process::Command as StdCommand;
-use crate::lume::lume::LumeClient;
-use crate::vm_provision::run_script_on_vm;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::time::SystemTime;
-use crate::lume_setup::cleanup_log_files;
+use tokio::time::{sleep, Duration};
+use uuid::Uuid;
 
 const CIRUN_BANNER: &str = r#"
        _                       _                    _
@@ -88,7 +87,7 @@ struct RunnerLogin {
 struct RunnerToProvision {
     name: String,
     provision_script: String,
-    os: String,         // This is actually the image to use
+    os: String, // This is actually the image to use
     cpu: u32,
     memory: u32,
     disk: u32,
@@ -112,12 +111,18 @@ struct CommandResponse {
 fn get_os_from_image(image: &str) -> String {
     let image_lower = image.to_lowercase();
 
-    if image_lower.contains("macos") || image_lower.contains("mac-os") ||
-        image_lower.contains("sonoma") || image_lower.contains("ventura") ||
-        image_lower.contains("monterey") {
+    if image_lower.contains("macos")
+        || image_lower.contains("mac-os")
+        || image_lower.contains("sonoma")
+        || image_lower.contains("ventura")
+        || image_lower.contains("monterey")
+    {
         return "macOS".to_string();
-    } else if image_lower.contains("ubuntu") || image_lower.contains("debian") ||
-        image_lower.contains("mint") || image_lower.contains("linux") {
+    } else if image_lower.contains("ubuntu")
+        || image_lower.contains("debian")
+        || image_lower.contains("mint")
+        || image_lower.contains("linux")
+    {
         return "linux".to_string();
     } else if image_lower.contains("windows") {
         return "windows".to_string();
@@ -133,13 +138,10 @@ fn get_hostname() -> String {
         return hostname;
     }
 
-    match StdCommand::new("hostname").output() {
-        Ok(output) => {
-            if let Ok(hostname) = String::from_utf8(output.stdout) {
-                return hostname.trim().to_string();
-            }
+    if let Ok(output) = StdCommand::new("hostname").output() {
+        if let Ok(hostname) = String::from_utf8(output.stdout) {
+            return hostname.trim().to_string();
         }
-        Err(_) => {}
     }
 
     "unknown-host".to_string()
@@ -225,11 +227,13 @@ impl CirunClient {
             Ok(lume) => {
                 match lume.list_vms().await {
                     Ok(vms) => {
-                        let running_vms: Vec<_> = vms.into_iter().filter(|vm| vm.state == "running").collect();
+                        let running_vms: Vec<_> =
+                            vms.into_iter().filter(|vm| vm.state == "running").collect();
                         let url = format!("{}/agent", self.base_url);
 
                         // Use the helper method instead of direct client access
-                        let res = self.create_request(reqwest::Method::POST, &url)
+                        let res = self
+                            .create_request(reqwest::Method::POST, &url)
                             .json(&json!({
                                 "agent": self.agent,
                                 "running_vms": running_vms.iter().map(|vm| {
@@ -254,393 +258,14 @@ impl CirunClient {
                                         info!("Response received with request ID: {}", id);
                                     }
                                 }
-                            },
+                            }
                             Err(e) => error!("Failed to send running VMs: {}", e),
                         }
-                    },
+                    }
                     Err(e) => error!("Failed to list VMs: {:?}", e),
                 }
-            },
+            }
             Err(e) => error!("Failed to initialize Lume client: {:?}", e),
-        }
-    }
-
-    // Check if a template exists with the given name
-    async fn check_template_exists(&self, template_name: &str) -> bool {
-        match LumeClient::new() {
-            Ok(lume) => {
-                match lume.get_vm(template_name).await {
-                    Ok(_) => {
-                        info!("Template '{}' already exists", template_name);
-                        true
-                    },
-                    Err(_) => {
-                        info!("Template '{}' does not exist", template_name);
-                        false
-                    }
-                }
-            },
-            Err(e) => {
-                error!("Failed to initialize Lume client: {:?}", e);
-                false
-            }
-        }
-    }
-
-    // Generate a template name based on the image configuration
-    fn generate_template_name(config: &TemplateConfig) -> String {
-        // Parse the image name and tag
-        let image_parts: Vec<&str> = config.image.split(':').collect();
-        let image_name = image_parts[0];
-        let image_tag = if image_parts.len() > 1 { image_parts[1] } else { "latest" };
-
-        // Create a sanitized image name (replace slashes and other invalid characters)
-        let sanitized_image = image_name.replace('/', "-").replace('.', "-");
-
-        // Create a configuration hash using registry, organization if present
-        let mut hasher = DefaultHasher::new();
-        config.registry.as_ref().unwrap_or(&"default".to_string()).hash(&mut hasher);
-        config.organization.as_ref().unwrap_or(&"default".to_string()).hash(&mut hasher);
-        config.os.hash(&mut hasher);
-        config.cpu.hash(&mut hasher);
-        config.memory.hash(&mut hasher);
-        config.disk.hash(&mut hasher);
-        let config_hash = hasher.finish() % 10000; // Limit to 4 digits for readability
-
-        // Format: cirun-template-{image}-{tag}-{cpu}-{mem}-{config_hash}
-        format!("cirun-template-{}-{}-{}-{}-{:04}",
-                sanitized_image,
-                image_tag,
-                config.cpu,
-                config.memory,
-                config_hash)
-    }
-
-    // Find an existing template with matching configuration
-    async fn find_matching_template(&self, config: &TemplateConfig) -> Option<String> {
-        match LumeClient::new() {
-            Ok(lume) => {
-                // Attempt to list all VMs
-                match lume.list_vms().await {
-                    Ok(vms) => {
-                        // Look for template VMs with matching specs
-                        for vm in vms {
-                            // Check if this is a template VM (starts with cirun-template)
-                            if vm.name.starts_with("cirun-template-") {
-                                // Check if specs match what we need
-                                if vm.cpu == config.cpu &&
-                                    vm.memory / 1024 == config.memory as u64 &&
-                                    vm.disk_size.total / 1024 >= config.disk as u64 &&
-                                    vm.os == config.os {
-                                    info!("Found existing template with matching specs: {}", vm.name);
-                                    return Some(vm.name);
-                                }
-                            }
-                        }
-                        None
-                    },
-                    Err(e) => {
-                        error!("Failed to list VMs when searching for matching template: {:?}", e);
-                        None
-                    }
-                }
-            },
-            Err(e) => {
-                error!("Failed to initialize Lume client when searching for matching template: {:?}", e);
-                None
-            }
-        }
-    }
-
-    // Pull an image using the Lume API
-    async fn pull_image(&self, config: &TemplateConfig, vm_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-        match LumeClient::new() {
-            Ok(lume) => {
-                info!("Pulling image '{}' for VM '{}'", config.image, vm_name);
-
-                // Parse the image name to extract organization if included in the format org/image:tag
-                let mut image_name = config.image.clone();
-                let mut organization = config.organization.clone();
-
-                // If image contains a slash, it likely has an organization prefix
-                if image_name.contains('/') {
-                    let parts: Vec<&str> = image_name.split('/').collect();
-                    if parts.len() > 1 {
-                        // If no explicit organization was provided, use the one from the image name
-                        if organization.is_none() {
-                            organization = Some(parts[0].to_string());
-                        }
-
-                        // Update image_name to only contain the repository part (after the slash)
-                        image_name = parts[1..].join("/");
-
-                        info!("Extracted organization '{}' from image name", organization.as_ref().unwrap());
-                        info!("Image name updated to '{}'", image_name);
-                    }
-                }
-
-                // Prepare the pull request data
-                let mut pull_data = json!({
-                    "image": image_name,
-                    "name": vm_name,
-                    // caching is a problem for large images
-                    // until this is fixed: https://github.com/trycua/cua/issues/60
-                    "noCache": true,
-                });
-
-                // Add optional parameters if present
-                if let Some(registry) = &config.registry {
-                    pull_data["registry"] = json!(registry);
-                }
-
-                if let Some(org) = &organization {
-                    pull_data["organization"] = json!(org);
-                }
-
-                // Construct the URL for the pull endpoint
-                let url = format!("{}/pull", lume.get_base_url());
-
-                // Send the pull request
-                info!("Sending pull request: {}", pull_data);
-
-                let client = Client::builder()
-                    .timeout(Duration::from_secs(3600))  // 1 hour timeout for the request itself
-                    .build()?;
-
-                let response = client.post(&url)
-                    .json(&pull_data)
-                    .send()
-                    .await?;
-
-                if !response.status().is_success() {
-                    let error_text = response.text().await?;
-                    error!("Failed to pull image: {}", error_text);
-                    return Err(format!("Failed to pull image: {}", error_text).into());
-                }
-
-                info!("Image pull request sent successfully for '{}'", config.image);
-                info!("Waiting for VM creation - this may take up to 30 minutes for large images...");
-
-                // Wait for the pull to complete with exponential backoff
-                let start_time = tokio::time::Instant::now();
-                let max_timeout = Duration::from_secs(1800);  // 30 minute max timeout
-
-                // Initial backoff of 10 seconds, then increasing
-                let mut backoff_seconds = 10;
-                let mut attempts = 0;
-
-                while start_time.elapsed() < max_timeout {
-                    attempts += 1;
-
-                    // Check if the VM exists after pulling
-                    match lume.get_vm(vm_name).await {
-                        Ok(vm) => {
-                            info!("✅ VM '{}' is now available after image pull. State: {}", vm_name, vm.state);
-                            return Ok(());
-                        },
-                        Err(e) => {
-                            // Calculate time elapsed and time remaining
-                            let elapsed = start_time.elapsed();
-                            let elapsed_minutes = elapsed.as_secs() / 60;
-                            let elapsed_seconds = elapsed.as_secs() % 60;
-                            let remaining = max_timeout.checked_sub(elapsed).unwrap_or_default();
-                            let remaining_minutes = remaining.as_secs() / 60;
-
-                            info!(
-                                "Still waiting for image pull to complete (attempt {}, elapsed: {}m {}s, remaining: ~{}m)... {}",
-                                attempts,
-                                elapsed_minutes,
-                                elapsed_seconds,
-                                remaining_minutes,
-                                e
-                            );
-
-                            // Sleep with exponential backoff, capped at 60 seconds
-                            sleep(Duration::from_secs(backoff_seconds)).await;
-
-                            // Increase backoff period for next attempt, but cap at 60 seconds
-                            backoff_seconds = std::cmp::min(backoff_seconds * 2, 60);
-                        }
-                    }
-
-                    // Every 5 minutes, query the list of all VMs to see progress
-                    if attempts % 15 == 0 {  // Approximately every 5 minutes with 20s backoff
-                        info!("Checking overall VM list to monitor progress...");
-                        match lume.list_vms().await {
-                            Ok(vms) => {
-                                info!("Current VMs in system: {}", vms.len());
-                                for vm in vms {
-                                    info!("- {} ({}, {})", vm.name, vm.state, vm.os);
-                                }
-                            },
-                            Err(e) => info!("Unable to list VMs: {}", e)
-                        }
-                    }
-                }
-
-                error!("Timed out after 30 minutes waiting for image pull to complete");
-                Err("Timed out waiting for image pull to complete".into())
-            },
-            Err(e) => {
-                error!("Failed to initialize Lume client: {:?}", e);
-                Err(e.into())
-            }
-        }
-    }
-
-    // Check if an image has already been pulled, regardless of VM configuration
-    async fn check_image_exists(&self, image: &str) -> Option<String> {
-        match LumeClient::new() {
-            Ok(lume) => {
-                // Extract base image name without organization
-                let base_image_name;
-                let image_tag;
-
-                // Parse the image string to extract name and tag
-                if image.contains('/') {
-                    // Handle image with organization
-                    let parts: Vec<&str> = image.split('/').collect();
-                    if parts.len() > 1 {
-                        // Get the part after the organization
-                        let repo_part = parts[1];
-
-                        // Split by colon to separate name and tag
-                        let repo_parts: Vec<&str> = repo_part.split(':').collect();
-                        base_image_name = repo_parts[0];
-                        image_tag = if repo_parts.len() > 1 { repo_parts[1] } else { "latest" };
-                    } else {
-                        // Unlikely case, but handle it anyway
-                        let repo_parts: Vec<&str> = image.split(':').collect();
-                        base_image_name = repo_parts[0];
-                        image_tag = if repo_parts.len() > 1 { repo_parts[1] } else { "latest" };
-                    }
-                } else {
-                    // Handle image without organization
-                    let parts: Vec<&str> = image.split(':').collect();
-                    base_image_name = parts[0];
-                    image_tag = if parts.len() > 1 { parts[1] } else { "latest" };
-                }
-
-                info!("Looking for VMs with base image: {} (tag: {})", base_image_name, image_tag);
-
-                // Attempt to list all VMs
-                match lume.list_vms().await {
-                    Ok(vms) => {
-                        // Look for template VMs with matching image
-                        for vm in vms {
-                            // For each VM, check if the name contains the base image name and tag
-                            if vm.name.contains(base_image_name) && vm.name.contains(image_tag) {
-                                info!("Found existing VM with the requested image: {}", vm.name);
-                                return Some(vm.name);
-                            }
-
-                            // Also check template names that might contain the image name
-                            if vm.name.starts_with("cirun-template-") &&
-                                vm.name.contains(&base_image_name.replace('-', "")) &&
-                                vm.name.contains(image_tag) {
-                                info!("Found existing template with the requested image: {}", vm.name);
-                                return Some(vm.name);
-                            }
-                        }
-                        None
-                    },
-                    Err(e) => {
-                        error!("Failed to list VMs when searching for existing image: {:?}", e);
-                        None
-                    }
-                }
-            },
-            Err(e) => {
-                error!("Failed to initialize Lume client when searching for existing image: {:?}", e);
-                None
-            }
-        }
-    }
-
-    // Create a template VM from the image
-    async fn create_template(&self, config: &TemplateConfig, template_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-        match LumeClient::new() {
-            Ok(lume) => {
-                // First, check if we already have a VM with this image
-                let existing_image = self.check_image_exists(&config.image).await;
-
-                if let Some(existing_vm) = existing_image {
-                    info!("Found existing VM with image '{}': {}", config.image, existing_vm);
-
-                    // If the existing VM is not the template we want to create, clone it
-                    if existing_vm != template_name {
-                        info!("Cloning existing VM '{}' to create template '{}'", existing_vm, template_name);
-                        match lume.clone_vm(&existing_vm, template_name).await {
-                            Ok(_) => {
-                                info!("Successfully cloned VM '{}' to '{}'", existing_vm, template_name);
-                            },
-                            Err(e) => {
-                                error!("Failed to clone VM '{}' to '{}': {:?}", existing_vm, template_name, e);
-                                // Fall back to pulling the image
-                                info!("Falling back to pulling the image directly");
-                                self.pull_image(config, template_name).await?;
-                            }
-                        }
-                    } else {
-                        info!("The existing VM is already the template we want to create");
-                    }
-                } else {
-                    // No existing VM with this image, need to pull
-                    info!("No existing VM found with image '{}', pulling it", config.image);
-                    info!("Creating template '{}' from image '{}'", template_name, config.image);
-                    info!("This process may take up to 30 minutes for large images");
-
-                    // Pull the image with the template name as the VM name
-                    self.pull_image(config, template_name).await?;
-                }
-
-                // Now configure the VM with the specified resources
-                info!("Configuring VM resources (CPU: {}, Memory: {}GB, Disk: {}GB)",
-                     config.cpu, config.memory, config.disk);
-
-                let update_config = json!({
-                    "cpu": config.cpu,
-                    "memory": format!("{}GB", config.memory),
-                    "diskSize": format!("{}GB", config.disk)
-                });
-
-                let update_url = format!("{}/vms/{}", lume.get_base_url(), template_name);
-
-                let client = Client::builder()
-                    .timeout(Duration::from_secs(600))  // 10 minute timeout for the configuration
-                    .build()?;
-
-                info!("Sending request to update VM configuration: {}", update_config);
-
-                let response = client.patch(&update_url)
-                    .json(&update_config)
-                    .send()
-                    .await?;
-
-                if !response.status().is_success() {
-                    let error_text = response.text().await?;
-                    error!("Failed to update template VM configuration: {}", error_text);
-                    return Err(format!("Failed to update template VM configuration: {}", error_text).into());
-                }
-
-                // Verify the configuration was applied correctly
-                match lume.get_vm(template_name).await {
-                    Ok(vm) => {
-                        info!("Template '{}' created and configured with: CPU: {}, Memory: {}MB, Disk: {}GB",
-                             template_name, vm.cpu, vm.memory / 1024, vm.disk_size.total / 1024);
-                    },
-                    Err(e) => {
-                        warn!("Unable to verify template configuration: {}", e);
-                    }
-                }
-
-                info!("✅ Template '{}' successfully created and ready for use", template_name);
-                Ok(())
-            },
-            Err(e) => {
-                error!("Failed to initialize Lume client: {:?}", e);
-                Err(e.into())
-            }
         }
     }
 
@@ -649,7 +274,7 @@ impl CirunClient {
         runner_name: &str,
         provision_script: &str,
         template_name: &str,
-        runner_login: &RunnerLogin
+        runner_login: &RunnerLogin,
     ) -> Result<(), Box<dyn std::error::Error>> {
         match LumeClient::new() {
             Ok(lume) => {
@@ -660,7 +285,10 @@ impl CirunClient {
                 let vm = if vm_exists {
                     vm_result.unwrap() // VM exists, unwrap safely
                 } else {
-                    info!("VM '{}' does not exist. Attempting to clone from template '{}'...", runner_name, template_name);
+                    info!(
+                        "VM '{}' does not exist. Attempting to clone from template '{}'...",
+                        runner_name, template_name
+                    );
 
                     // Check if template exists
                     match lume.get_vm(template_name).await {
@@ -668,19 +296,33 @@ impl CirunClient {
                             // Template exists, clone it
                             match lume.clone_vm(template_name, runner_name).await {
                                 Ok(_) => {
-                                    info!("VM '{}' cloned successfully from template '{}'", runner_name, template_name);
+                                    info!(
+                                        "VM '{}' cloned successfully from template '{}'",
+                                        runner_name, template_name
+                                    );
                                     lume.get_vm(runner_name).await? // Get VM details after cloning
-                                },
+                                }
                                 Err(e) => {
-                                    error!("Failed to clone VM from template '{}': {:?}", template_name, e);
-                                    return Err(format!("Failed to clone VM from template '{}': {:?}", template_name, e).into());
+                                    error!(
+                                        "Failed to clone VM from template '{}': {:?}",
+                                        template_name, e
+                                    );
+                                    return Err(format!(
+                                        "Failed to clone VM from template '{}': {:?}",
+                                        template_name, e
+                                    )
+                                    .into());
                                 }
                             }
-                        },
+                        }
                         Err(e) => {
                             // Template doesn't exist
                             error!("Template '{}' not found: {:?}", template_name, e);
-                            return Err(format!("Template '{}' not found. Cannot provision runner.", template_name).into());
+                            return Err(format!(
+                                "Template '{}' not found. Cannot provision runner.",
+                                template_name
+                            )
+                            .into());
                         }
                     }
                 };
@@ -689,7 +331,10 @@ impl CirunClient {
 
                 // If VM exists but is not stopped, skip provisioning
                 if vm.state != "stopped" {
-                    info!("VM '{}' exists and is not stopped. Skipping provisioning.", runner_name);
+                    info!(
+                        "VM '{}' exists and is not stopped. Skipping provisioning.",
+                        runner_name
+                    );
                     return Ok(());
                 }
 
@@ -700,18 +345,28 @@ impl CirunClient {
                 info!("Provisioning runner: {}", runner_name);
                 info!("Running provision script on VM");
 
-                match run_script_on_vm(&lume, runner_name, provision_script, &username, &password, 20, true).await {
+                match run_script_on_vm(
+                    &lume,
+                    runner_name,
+                    provision_script,
+                    &username,
+                    &password,
+                    20,
+                    true,
+                )
+                .await
+                {
                     Ok(output) => {
                         info!("Runner provisioning completed successfully");
                         info!("Script output: {}", output);
                         Ok(())
-                    },
+                    }
                     Err(e) => {
                         error!("Failed to provision runner: {}", e);
-                        Err(e.into())
+                        Err(e)
                     }
                 }
-            },
+            }
             Err(e) => {
                 error!("Failed to initialize Lume client: {:?}", e);
                 Err(e.into())
@@ -734,21 +389,25 @@ impl CirunClient {
                             Ok(_) => {
                                 info!("VM '{}' deleted successfully", runner_name);
                                 Ok(())
-                            },
+                            }
                             Err(e) => {
                                 error!("Failed to delete VM '{}': {:?}", runner_name, e);
-                                Err(format!("Failed to delete VM '{}': {:?}", runner_name, e).into())
+                                Err(format!("Failed to delete VM '{}': {:?}", runner_name, e)
+                                    .into())
                             }
                         }
-                    },
+                    }
                     Err(e) => {
-                        warn!("VM '{}' not found or error retrieving VM details: {:?}", runner_name, e);
+                        warn!(
+                            "VM '{}' not found or error retrieving VM details: {:?}",
+                            runner_name, e
+                        );
                         // Consider this a success since the VM doesn't exist anyway
                         info!("VM '{}' doesn't exist or can't be accessed - considering delete successful", runner_name);
                         Ok(())
                     }
                 }
-            },
+            }
             Err(e) => {
                 error!("Failed to initialize Lume client: {:?}", e);
                 Err(e.into())
@@ -765,7 +424,8 @@ impl CirunClient {
         });
 
         // Use the helper method instead of direct client access
-        let response = self.create_request(reqwest::Method::GET, &url)
+        let response = self
+            .create_request(reqwest::Method::GET, &url)
             .json(&request_data)
             .send()
             .await?;
@@ -775,14 +435,17 @@ impl CirunClient {
 
         // Handle any runners that need deletion
         if !json.runners_to_delete.is_empty() {
-            info!("Received {} runners to delete", json.runners_to_delete.len());
+            info!(
+                "Received {} runners to delete",
+                json.runners_to_delete.len()
+            );
 
             for runner in &json.runners_to_delete {
                 match self.delete_runner(&runner.name).await {
                     Ok(_) => {
                         info!("✅ Successfully deleted runner: {}", runner.name);
                         self.report_running_vms().await;
-                    },
+                    }
 
                     Err(e) => error!("❌ Failed to delete runner {}: {}", runner.name, e),
                 }
@@ -791,45 +454,56 @@ impl CirunClient {
 
         // Handle runners that need provisioning
         if !json.runners_to_provision.is_empty() {
-            info!("Received {} runners to provision", json.runners_to_provision.len());
+            info!(
+                "Received {} runners to provision",
+                json.runners_to_provision.len()
+            );
 
             for runner in &json.runners_to_provision {
                 info!("Processing runner: {}", runner.name);
                 info!("  - Image/OS: {}", runner.os);
-                info!("  - CPU: {}, Memory: {}GB, Disk: {}GB", runner.cpu, runner.memory, runner.disk);
+                info!(
+                    "  - CPU: {}, Memory: {}GB, Disk: {}GB",
+                    runner.cpu, runner.memory, runner.disk
+                );
 
                 // Create a template config from the runner specification
                 let template_config = TemplateConfig {
                     image: runner.os.clone(),
-                    registry: None,           // Default registry
-                    organization: None,       // Default organization
+                    registry: None,     // Default registry
+                    organization: None, // Default organization
                     cpu: runner.cpu,
                     memory: runner.memory,
                     disk: runner.disk,
-                    os: get_os_from_image(&runner.os),  // Determine OS type from image name
+                    os: get_os_from_image(&runner.os), // Determine OS type from image name
                 };
 
                 // First, try to find an existing template with matching configuration
-                let template_name = if let Some(existing_template) = self.find_matching_template(&template_config).await {
-                    info!("Found existing template with matching configuration: {}", existing_template);
+                let template_name = if let Some(existing_template) =
+                    find_matching_template(&template_config).await
+                {
+                    info!(
+                        "Found existing template with matching configuration: {}",
+                        existing_template
+                    );
                     existing_template
                 } else {
                     // Generate a new template name
-                    let generated_name = Self::generate_template_name(&template_config);
+                    let generated_name = generate_template_name(&template_config);
 
                     // Check if the template with this specific name already exists
-                    let template_exists = self.check_template_exists(&generated_name).await;
+                    let template_exists = check_template_exists(&generated_name).await;
 
                     if !template_exists {
                         // Create the template if it doesn't exist
                         info!("No matching template found. Creating new template '{}' from image '{}'",
                              generated_name, template_config.image);
 
-                        match self.create_template(&template_config, &generated_name).await {
+                        match create_template(&template_config, &generated_name).await {
                             Ok(_) => {
                                 info!("✅ Successfully created template: {}", generated_name);
                                 generated_name
-                            },
+                            }
                             Err(e) => {
                                 error!("❌ Failed to create template {}: {}", generated_name, e);
                                 // If template creation fails, fall back to default template
@@ -844,29 +518,57 @@ impl CirunClient {
                 };
 
                 // Provision the runner using the template
-                info!("Provisioning runner '{}' with template '{}'", runner.name, template_name);
+                info!(
+                    "Provisioning runner '{}' with template '{}'",
+                    runner.name, template_name
+                );
 
-                match self.provision_runner(&runner.name, &runner.provision_script, &template_name, &runner.login).await {
+                match self
+                    .provision_runner(
+                        &runner.name,
+                        &runner.provision_script,
+                        &template_name,
+                        &runner.login,
+                    )
+                    .await
+                {
                     Ok(_) => {
-                        info!("✅ Successfully provisioned runner: {} using template {}", runner.name, template_name);
+                        info!(
+                            "✅ Successfully provisioned runner: {} using template {}",
+                            runner.name, template_name
+                        );
                         self.report_running_vms().await;
-                    },
+                    }
                     Err(e) => {
-                        error!("❌ Failed to provision runner {} using template {}: {}", runner.name, template_name, e);
+                        error!(
+                            "❌ Failed to provision runner {} using template {}: {}",
+                            runner.name, template_name, e
+                        );
 
                         // If provisioning fails with the dynamic template, try the default template as fallback
                         if template_name != "cirun-runner-template" {
-                            info!("Attempting fallback to default template for runner '{}'", runner.name);
-                            match self.provision_runner(
-                                &runner.name, &runner.provision_script, "cirun-runner-template",
-                                &runner.login
-                            ).await {
+                            info!(
+                                "Attempting fallback to default template for runner '{}'",
+                                runner.name
+                            );
+                            match self
+                                .provision_runner(
+                                    &runner.name,
+                                    &runner.provision_script,
+                                    "cirun-runner-template",
+                                    &runner.login,
+                                )
+                                .await
+                            {
                                 Ok(_) => {
                                     info!("✅ Successfully provisioned runner: {} using default template", runner.name);
                                     self.report_running_vms().await;
-                                },
+                                }
                                 Err(fallback_err) => {
-                                    error!("❌ Fallback also failed for runner {}: {}", runner.name, fallback_err);
+                                    error!(
+                                        "❌ Fallback also failed for runner {}: {}",
+                                        runner.name, fallback_err
+                                    );
                                 }
                             }
                         }
@@ -905,22 +607,22 @@ async fn main() {
     let client = CirunClient::new(&cirun_api_url, &args.api_token, agent_info);
 
     // Check Lume connectivity before entering the main loop
-    lume_setup::download_and_run_lume().await;
+    lume::download_and_run_lume().await;
     info!("Checking Lume connectivity...");
     match LumeClient::new() {
-        Ok(lume) => {
-            match lume.list_vms().await {
-                Ok(vms) => {
-                    info!("✅ Successfully connected to Lume. Found {} VMs", vms.len());
-                    for vm in vms {
-                        info!("- {} ({}, {}, CPU: {}, Memory: {}, Disk: {})",
-                             vm.name, vm.state, vm.os, vm.cpu, vm.memory, vm.disk_size.total);
-                    }
-                },
-                Err(e) => {
-                    error!("❌ Failed to connect to Lume API: {:?}", e);
-                    error!("Agent will continue but VM operations will likely fail");
+        Ok(lume) => match lume.list_vms().await {
+            Ok(vms) => {
+                info!("✅ Successfully connected to Lume. Found {} VMs", vms.len());
+                for vm in vms {
+                    info!(
+                        "- {} ({}, {}, CPU: {}, Memory: {}, Disk: {})",
+                        vm.name, vm.state, vm.os, vm.cpu, vm.memory, vm.disk_size.total
+                    );
                 }
+            }
+            Err(e) => {
+                error!("❌ Failed to connect to Lume API: {:?}", e);
+                error!("Agent will continue but VM operations will likely fail");
             }
         },
         Err(e) => {
@@ -939,8 +641,14 @@ async fn main() {
     loop {
         match client.manage_runner_lifecycle().await {
             Ok(response) => {
-                info!("Attempted runners to provision: {}", response.runners_to_provision.len());
-                info!("Attempted runners to delete: {}", response.runners_to_delete.len());
+                info!(
+                    "Attempted runners to provision: {}",
+                    response.runners_to_provision.len()
+                );
+                info!(
+                    "Attempted runners to delete: {}",
+                    response.runners_to_delete.len()
+                );
             }
             Err(e) => error!("Error fetching command: {}", e),
         }
@@ -951,11 +659,12 @@ async fn main() {
         // Check if it's time to clean up logs
         if let Ok(duration) = SystemTime::now().duration_since(last_cleanup) {
             if duration >= cleanup_interval {
-                match cleanup_log_files(&log_dir, 7, 100) { // Keep logs for 7 days, rotate at 100MB
+                match cleanup_log_files(&log_dir, 7, 100) {
+                    // Keep logs for 7 days, rotate at 100MB
                     Ok(_) => {
                         last_cleanup = SystemTime::now();
                         debug!("Updated last cleanup time: {:?}", last_cleanup);
-                    },
+                    }
                     Err(e) => error!("Failed to clean up logs: {}", e),
                 }
             }
@@ -978,7 +687,10 @@ mod tests {
         assert_eq!(get_os_from_image("macos-ventura"), "macOS");
         assert_eq!(get_os_from_image("macos-monterey"), "macOS");
         assert_eq!(get_os_from_image("mac-os-something"), "macOS");
-        assert_eq!(get_os_from_image("cirunlabs/macos-sequoia-xcode:15.3.1"), "macOS");
+        assert_eq!(
+            get_os_from_image("cirunlabs/macos-sequoia-xcode:15.3.1"),
+            "macOS"
+        );
 
         // Linux variants
         assert_eq!(get_os_from_image("ubuntu-20.04"), "linux");
@@ -1030,12 +742,12 @@ mod tests {
         };
 
         // Same configs should produce same template names
-        let name1 = CirunClient::generate_template_name(&config1);
-        let name2 = CirunClient::generate_template_name(&config2);
+        let name1 = generate_template_name(&config1);
+        let name2 = generate_template_name(&config2);
         assert_eq!(name1, name2);
 
         // Different configs should produce different template names
-        let name3 = CirunClient::generate_template_name(&config3);
+        let name3 = generate_template_name(&config3);
         assert_ne!(name1, name3);
 
         // Check that template name contains expected parts
@@ -1048,7 +760,10 @@ mod tests {
     #[test]
     fn test_organization_extraction() {
         // Test function to simulate organization extraction
-        fn extract_org_and_image(image: &str, organization: Option<String>) -> (String, Option<String>) {
+        fn extract_org_and_image(
+            image: &str,
+            organization: Option<String>,
+        ) -> (String, Option<String>) {
             let mut image_name = image.to_string();
             let mut org = organization;
 
@@ -1077,7 +792,10 @@ mod tests {
         assert_eq!(org1, Some("cirunlabs".to_string()));
 
         // Case 2: Image with organization, with explicit organization (explicit should take precedence)
-        let (image2, org2) = extract_org_and_image("cirunlabs/macos-sequoia-xcode:15.3.1", Some("explicit-org".to_string()));
+        let (image2, org2) = extract_org_and_image(
+            "cirunlabs/macos-sequoia-xcode:15.3.1",
+            Some("explicit-org".to_string()),
+        );
         assert_eq!(image2, "macos-sequoia-xcode:15.3.1");
         assert_eq!(org2, Some("explicit-org".to_string()));
 
@@ -1087,7 +805,10 @@ mod tests {
         assert_eq!(org3, None);
 
         // Case 4: Image without organization, with explicit organization
-        let (image4, org4) = extract_org_and_image("macos-sequoia-xcode:15.3.1", Some("explicit-org".to_string()));
+        let (image4, org4) = extract_org_and_image(
+            "macos-sequoia-xcode:15.3.1",
+            Some("explicit-org".to_string()),
+        );
         assert_eq!(image4, "macos-sequoia-xcode:15.3.1");
         assert_eq!(org4, Some("explicit-org".to_string()));
 
