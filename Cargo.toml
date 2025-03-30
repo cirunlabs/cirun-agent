@@ -1,6 +1,6 @@
 [package]
 name = "cirun-agent"
-version = "0.2.8"
+version = "0.2.9"
 edition = "2021"
 repository = "https://github.com/aktechlabs/cirun-agent"
 authors = ["Amit Kumar <dtu.amit@gmail.com>"]
