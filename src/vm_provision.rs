@@ -1,14 +1,14 @@
-use std::process::{Command, Stdio};
+use crate::lume::{LumeClient, RunConfig};
+use log::{error, info, warn};
+use std::fs::{remove_file, File};
 use std::io::Write;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
-use log::{info, error, warn};
 use tempfile::NamedTempFile;
 use tokio::time::sleep;
-use crate::lume::lume::{LumeClient, RunConfig};
-use std::fs::{File, remove_file};
 
-use backon::{ExponentialBuilder, Retryable};
 use anyhow::Result;
+use backon::{ExponentialBuilder, Retryable};
 
 pub async fn run_script_on_vm(
     lume: &LumeClient,
@@ -17,7 +17,7 @@ pub async fn run_script_on_vm(
     username: &str,
     password: &str,
     timeout_seconds: u64,
-    run_detached: bool
+    run_detached: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
     // Step 1: Get VM details and verify it does not exists
     info!("Getting details for VM: {}", vm_name);
@@ -26,7 +26,10 @@ pub async fn run_script_on_vm(
 
     // Step 2: If the VM is not running, try to start it with retries
     if vm.state != "running" {
-        info!("VM is not running. Current state: {}. Attempting to start...", vm.state);
+        info!(
+            "VM is not running. Current state: {}. Attempting to start...",
+            vm.state
+        );
 
         let start_vm = || async {
             let run_config = RunConfig {
@@ -34,7 +37,9 @@ pub async fn run_script_on_vm(
                 shared_directories: None,
                 recovery_mode: None,
             };
-            lume.run_vm(vm_name, Some(run_config)).await.map_err(|e| anyhow::anyhow!("Failed to start VM: {:?}", e))
+            lume.run_vm(vm_name, Some(run_config))
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to start VM: {:?}", e))
         };
 
         start_vm
@@ -56,7 +61,9 @@ pub async fn run_script_on_vm(
     info!("Creating temporary script file");
     let mut temp_file = NamedTempFile::new()?;
     temp_file.write_all(script_content.as_bytes())?;
-    let temp_file_path = temp_file.path().to_str()
+    let temp_file_path = temp_file
+        .path()
+        .to_str()
         .ok_or("Failed to get temporary file path")?;
 
     // Step 5: Create a temporary password file for sshpass
@@ -65,16 +72,20 @@ pub async fn run_script_on_vm(
 
     // Step 6: Setup SSH options
     let ssh_options = vec![
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "UserKnownHostsFile=/dev/null",
-        "-o", "ConnectTimeout=10",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-o",
+        "ConnectTimeout=10",
     ];
 
     // Step 7: Test SSH connection with retries
     info!("Testing SSH connection to VM");
     let ssh_test_result = || async {
         let output = Command::new("sshpass")
-            .arg("-f").arg(&password_file_path)
+            .arg("-f")
+            .arg(&password_file_path)
             .arg("ssh")
             .args(&ssh_options)
             .arg(format!("{}@{}", username, ip_address))
@@ -84,7 +95,10 @@ pub async fn run_script_on_vm(
             .output()?;
 
         if !output.status.success() {
-            Err(anyhow::anyhow!("SSH connection failed: {}", String::from_utf8_lossy(&output.stderr)))
+            Err(anyhow::anyhow!(
+                "SSH connection failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ))
         } else {
             Ok(())
         }
@@ -105,17 +119,24 @@ pub async fn run_script_on_vm(
 
     let scp_transfer = || async {
         let output = Command::new("sshpass")
-            .arg("-f").arg(&password_file_path)
+            .arg("-f")
+            .arg(&password_file_path)
             .arg("scp")
             .args(&ssh_options)
             .arg(temp_file_path)
-            .arg(format!("{}@{}:{}", username, ip_address, remote_script_path))
+            .arg(format!(
+                "{}@{}:{}",
+                username, ip_address, remote_script_path
+            ))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()?;
 
         if !output.status.success() {
-            Err(anyhow::anyhow!("SCP failed: {}", String::from_utf8_lossy(&output.stderr)))
+            Err(anyhow::anyhow!(
+                "SCP failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ))
         } else {
             Ok(())
         }
@@ -149,18 +170,25 @@ pub async fn run_script_on_vm(
             // Execute in normal mode
             info!("Executing script on VM and waiting for completion");
             Command::new("sshpass")
-                .arg("-f").arg(&password_file_path)
+                .arg("-f")
+                .arg(&password_file_path)
                 .arg("ssh")
                 .args(&ssh_options)
                 .arg(format!("{}@{}", username, ip_address))
-                .arg(format!("chmod +x {} && {}", remote_script_path, remote_script_path))
+                .arg(format!(
+                    "chmod +x {} && {}",
+                    remote_script_path, remote_script_path
+                ))
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .output()?
         };
 
         if !output.status.success() {
-            Err(anyhow::anyhow!("Script execution failed: {}", String::from_utf8_lossy(&output.stderr)))
+            Err(anyhow::anyhow!(
+                "Script execution failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ))
         } else {
             Ok(String::from_utf8_lossy(&output.stdout).to_string())
         }
@@ -181,11 +209,13 @@ pub async fn run_script_on_vm(
     Ok(script_output)
 }
 
-
 // Helper function to create a temporary file containing the password
 fn create_password_file(password: &str) -> Result<String, Box<dyn std::error::Error>> {
     let temp_dir = std::env::temp_dir();
-    let password_file_path = temp_dir.join(format!("sshpass_{}.txt", Instant::now().elapsed().as_millis()));
+    let password_file_path = temp_dir.join(format!(
+        "sshpass_{}.txt",
+        Instant::now().elapsed().as_millis()
+    ));
 
     let mut file = File::create(&password_file_path)?;
     file.write_all(password.as_bytes())?;
@@ -215,7 +245,7 @@ fn clean_up_password_file(file_path: &str) {
 async fn wait_for_vm_ip(
     lume: &LumeClient,
     vm_name: &str,
-    timeout_seconds: u64
+    timeout_seconds: u64,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let start_time = Instant::now();
     let timeout = Duration::from_secs(timeout_seconds);
@@ -232,7 +262,7 @@ async fn wait_for_vm_ip(
                         }
                     }
                 }
-            },
+            }
             Err(e) => {
                 error!("Error checking VM state: {:?}", e);
             }

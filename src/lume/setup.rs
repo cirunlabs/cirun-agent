@@ -1,18 +1,15 @@
+use log::{error, info, warn};
 use std::fs;
-use std::path::{PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use log::{info, error, warn};
 use std::{thread, time::Duration, time::SystemTime};
 
 use chrono::{DateTime, Utc};
 use std::path::Path;
 
-
 pub async fn download_and_run_lume() {
     // Spawn a blocking task to handle the file operations
-    let result = tokio::task::spawn_blocking(move || {
-        download_and_run_lume_internal()
-    }).await;
+    let result = tokio::task::spawn_blocking(download_and_run_lume_internal).await;
 
     // Handle the result
     match result {
@@ -23,7 +20,11 @@ pub async fn download_and_run_lume() {
 }
 
 // Function to clean up old log files
-pub fn cleanup_log_files(log_dir: &Path, max_age_days: u64, max_size_mb: u64) -> Result<(), Box<dyn std::error::Error>> {
+pub fn cleanup_log_files(
+    log_dir: &Path,
+    max_age_days: u64,
+    max_size_mb: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
     info!("Checking log files for cleanup...");
 
     if !log_dir.exists() {
@@ -52,8 +53,11 @@ pub fn cleanup_log_files(log_dir: &Path, max_age_days: u64, max_size_mb: u64) ->
         if let Ok(modified) = metadata.modified() {
             if let Ok(age) = now.duration_since(modified) {
                 if age > max_age {
-                    info!("Removing old log file: {:?} (age: {} days)",
-                          path, age.as_secs() / (24 * 60 * 60));
+                    info!(
+                        "Removing old log file: {:?} (age: {} days)",
+                        path,
+                        age.as_secs() / (24 * 60 * 60)
+                    );
                     fs::remove_file(&path)?;
                     continue;
                 }
@@ -62,17 +66,20 @@ pub fn cleanup_log_files(log_dir: &Path, max_age_days: u64, max_size_mb: u64) ->
 
         // Check file size
         if file_size > max_size {
-            info!("Log file too large, rotating: {:?} (size: {:.2} MB)",
-                  path, file_size as f64 / 1024.0 / 1024.0);
+            info!(
+                "Log file too large, rotating: {:?} (size: {:.2} MB)",
+                path,
+                file_size as f64 / 1024.0 / 1024.0
+            );
 
             // Create a backup with timestamp
-            let timestamp: DateTime<Utc> = metadata.modified()
+            let timestamp: DateTime<Utc> = metadata
+                .modified()
                 .unwrap_or_else(|_| SystemTime::now())
                 .into();
 
-            let backup_path = path.with_extension(
-                format!("log.{}", timestamp.format("%Y%m%d%H%M%S"))
-            );
+            let backup_path =
+                path.with_extension(format!("log.{}", timestamp.format("%Y%m%d%H%M%S")));
 
             // Rename the current log file to the backup name
             fs::rename(&path, &backup_path)?;
@@ -86,14 +93,12 @@ pub fn cleanup_log_files(log_dir: &Path, max_age_days: u64, max_size_mb: u64) ->
                 .filter(|e| {
                     let p = e.path();
                     let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    name.starts_with(&format!("{}", path.file_name().unwrap().to_str().unwrap()))
+                    name.starts_with(&path.file_name().unwrap().to_str().unwrap().to_string())
                         && name.contains("log.")
                 })
                 .collect();
 
-            backups.sort_by_key(|e| {
-                std::cmp::Reverse(e.path())
-            });
+            backups.sort_by_key(|e| std::cmp::Reverse(e.path()));
 
             // Remove older backups (keep 5 newest)
             for old_backup in backups.into_iter().skip(5) {
@@ -111,7 +116,10 @@ pub fn cleanup_log_files(log_dir: &Path, max_age_days: u64, max_size_mb: u64) ->
 fn download_and_run_lume_internal() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Define constants
     let lume_version = std::env::var("LUME_VERSION").unwrap_or_else(|_| String::from("0.1.21"));
-    let lume_url = format!("https://github.com/trycua/cua/releases/download/lume-v{}/lume-{}-darwin-arm64.tar.gz", lume_version, lume_version);
+    let lume_url = format!(
+        "https://github.com/trycua/cua/releases/download/lume-v{}/lume-{}-darwin-arm64.tar.gz",
+        lume_version, lume_version
+    );
     let install_dir = PathBuf::from(format!("{}/.lume", std::env::var("HOME")?));
     let lume_bin_path = install_dir.join("lume");
 
@@ -160,7 +168,10 @@ fn download_and_run_lume_internal() -> Result<(), Box<dyn std::error::Error + Se
 
         // Find the lume binary
         let mut lume_binary = None;
-        for entry in walkdir::WalkDir::new(&temp_dir).into_iter().filter_map(|e| e.ok()) {
+        for entry in walkdir::WalkDir::new(&temp_dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
             let path = entry.path();
             if path.is_file() && path.file_name().and_then(|n| n.to_str()) == Some("lume") {
                 lume_binary = Some(path.to_path_buf());
@@ -185,7 +196,10 @@ fn download_and_run_lume_internal() -> Result<(), Box<dyn std::error::Error + Se
         // Clean up the temporary directory
         fs::remove_dir_all(&temp_dir)?;
 
-        info!("Lume v{} installed successfully at {:?}", lume_version, lume_bin_path);
+        info!(
+            "Lume v{} installed successfully at {:?}",
+            lume_version, lume_bin_path
+        );
     } else {
         info!("Lume is already installed at {:?}", lume_bin_path);
     }
@@ -231,7 +245,10 @@ fn download_and_run_lume_internal() -> Result<(), Box<dyn std::error::Error + Se
             .stderr(Stdio::from(stderr_file))
             .spawn()?;
 
-        info!("Lume server started in the background with PID: {}", child.id());
+        info!(
+            "Lume server started in the background with PID: {}",
+            child.id()
+        );
         info!("Lume logs available at {:?}", log_dir);
 
         // Give lume some time to start
@@ -247,7 +264,10 @@ fn download_and_run_lume_internal() -> Result<(), Box<dyn std::error::Error + Se
             .unwrap_or(false);
 
         if !is_running {
-            warn!("Lume process terminated immediately after starting. Check logs at {:?}", stderr_log);
+            warn!(
+                "Lume process terminated immediately after starting. Check logs at {:?}",
+                stderr_log
+            );
         }
     }
     Ok(())

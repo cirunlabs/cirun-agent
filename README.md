@@ -120,6 +120,42 @@ cargo build
 cargo test
 ```
 
+### Linting and Formatting
+
+The project uses Clippy for linting and rustfmt for code formatting.
+
+#### Install Linting Tools
+
+```bash
+rustup component add clippy rustfmt
+```
+
+#### Run Linter
+
+```bash
+cargo clippy
+```
+
+To automatically fix some linting issues:
+
+```bash
+cargo clippy --fix
+```
+
+#### Format Code
+
+```bash
+cargo fmt
+```
+
+#### Pre-commit Checks
+
+Run both linting and formatting checks before committing:
+
+```bash
+cargo fmt -- --check && cargo clippy
+```
+
 ## 🔍 Troubleshooting
 
 ### Debug Logging
