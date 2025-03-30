@@ -79,6 +79,12 @@ struct TemplateConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+struct RunnerLogin {
+    username: String,
+    password: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 struct RunnerToProvision {
     name: String,
     provision_script: String,
@@ -86,6 +92,7 @@ struct RunnerToProvision {
     cpu: u32,
     memory: u32,
     disk: u32,
+    login: RunnerLogin,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -637,7 +644,13 @@ impl CirunClient {
         }
     }
 
-    async fn provision_runner(&self, runner_name: &str, provision_script: &str, template_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    async fn provision_runner(
+        &self,
+        runner_name: &str,
+        provision_script: &str,
+        template_name: &str,
+        runner_login: &RunnerLogin
+    ) -> Result<(), Box<dyn std::error::Error>> {
         match LumeClient::new() {
             Ok(lume) => {
                 // Check if VM exists by trying to get its details
@@ -681,8 +694,8 @@ impl CirunClient {
                 }
 
                 // Read SSH credentials from environment variables or use defaults
-                let username = env::var("LUME_SSH_USER").unwrap_or_else(|_| "cirun".to_string());
-                let password = env::var("LUME_SSH_PASSWORD").unwrap_or_else(|_| "cirun".to_string());
+                let username = runner_login.username.clone();
+                let password = runner_login.password.clone();
 
                 info!("Provisioning runner: {}", runner_name);
                 info!("Running provision script on VM");
@@ -833,7 +846,7 @@ impl CirunClient {
                 // Provision the runner using the template
                 info!("Provisioning runner '{}' with template '{}'", runner.name, template_name);
 
-                match self.provision_runner(&runner.name, &runner.provision_script, &template_name).await {
+                match self.provision_runner(&runner.name, &runner.provision_script, &template_name, &runner.login).await {
                     Ok(_) => {
                         info!("✅ Successfully provisioned runner: {} using template {}", runner.name, template_name);
                         self.report_running_vms().await;
@@ -844,7 +857,10 @@ impl CirunClient {
                         // If provisioning fails with the dynamic template, try the default template as fallback
                         if template_name != "cirun-runner-template" {
                             info!("Attempting fallback to default template for runner '{}'", runner.name);
-                            match self.provision_runner(&runner.name, &runner.provision_script, "cirun-runner-template").await {
+                            match self.provision_runner(
+                                &runner.name, &runner.provision_script, "cirun-runner-template",
+                                &runner.login
+                            ).await {
                                 Ok(_) => {
                                     info!("✅ Successfully provisioned runner: {} using default template", runner.name);
                                     self.report_running_vms().await;

@@ -68,9 +68,6 @@ Checkout docs for quick start guide: https://docs.cirun.io/on-prem
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `CIRUN_API_URL` | Base URL for Cirun API | https://api.cirun.io/api/v1 |
-| `LUME_SSH_USER` | Username for SSH connections to VMs | cirun |
-| `LUME_SSH_PASSWORD` | Password for SSH connections to VMs | cirun |
-| `HOSTNAME` | Override system hostname detection | (System hostname) |
 
 ## 🔌 Lume Virtualization
 

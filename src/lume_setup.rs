@@ -110,7 +110,7 @@ pub fn cleanup_log_files(log_dir: &Path, max_age_days: u64, max_size_mb: u64) ->
 
 fn download_and_run_lume_internal() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Define constants
-    let lume_version = std::env::var("LUME_VERSION").unwrap_or_else(|_| String::from("0.1.19"));
+    let lume_version = std::env::var("LUME_VERSION").unwrap_or_else(|_| String::from("0.1.21"));
     let lume_url = format!("https://github.com/trycua/cua/releases/download/lume-v{}/lume-{}-darwin-arm64.tar.gz", lume_version, lume_version);
     let install_dir = PathBuf::from(format!("{}/.lume", std::env::var("HOME")?));
     let lume_bin_path = install_dir.join("lume");
