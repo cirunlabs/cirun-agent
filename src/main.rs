@@ -99,6 +99,7 @@ struct RunnerToDelete {
     name: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize)]
 struct CommandResponse {
     command: String,
