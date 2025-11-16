@@ -16,7 +16,7 @@
 [![Documentation](https://img.shields.io/badge/docs-cirun-%230075A8.svg?style=for-the-badge)](https://docs.cirun.io/on-prem)
 </div>
 
-A robust Rust agent for provisioning and managing CI/CD runners through the Cirun platform, offering automated VM lifecycle management with Lume virtualization.
+A robust Rust agent for provisioning and managing CI/CD runners through the Cirun platform, offering automated VM lifecycle management with Lume (macOS) and Meda (Linux) virtualization.
 
 ## ✨ Features
 
@@ -51,7 +51,30 @@ cargo build --release
 
 ## 🚀 Quick Start
 
-Checkout docs for quick start guide: https://docs.cirun.io/on-prem
+### Install as System Service
+
+Install and run cirun-agent as a persistent system service (survives reboots):
+
+```bash
+# Linux (systemd)
+sudo cirun-agent --api-token YOUR_TOKEN --install-service
+
+# macOS (launchd)
+cirun-agent --api-token YOUR_TOKEN --install-service
+```
+
+The service will:
+- Start automatically on boot
+- Restart on failure
+- Log to system journal (Linux) or `~/Library/Logs/cirun-agent.log` (macOS)
+
+### Run Manually
+
+```bash
+cirun-agent --api-token YOUR_TOKEN
+```
+
+For more details, checkout docs: https://docs.cirun.io/on-prem
 
 ## ⚙️ Configuration
 
@@ -60,8 +83,10 @@ Checkout docs for quick start guide: https://docs.cirun.io/on-prem
 | Argument | Short | Description | Default |
 |----------|-------|-------------|---------|
 | `--api-token` | `-a` | API token for authentication | (Required) |
-| `--interval` | `-i` | Polling interval in seconds | 10 |
+| `--interval` | `-i` | Polling interval in seconds | 5 |
 | `--id-file` | `-f` | Agent ID file path | .agent_id |
+| `--verbose` | `-v` | Enable verbose logging | false |
+| `--install-service` | | Install as system service | false |
 
 ### Environment Variables
 
@@ -69,11 +94,13 @@ Checkout docs for quick start guide: https://docs.cirun.io/on-prem
 |----------|-------------|---------|
 | `CIRUN_API_URL` | Base URL for Cirun API | https://api.cirun.io/api/v1 |
 
-## 🔌 Lume Virtualization
+## 🔌 Virtualization
 
-Cirun-agent relies on Lume for VM provisioning and management. Lume is a lightweight virtualization platform that enables efficient cloning and management of virtual machines.
+Cirun-agent uses platform-specific virtualization:
+- **Linux**: [Meda](https://github.com/cirunlabs/meda) - Lightweight KVM-based VM management
+- **macOS**: [Lume](https://github.com/trycua/cua/tree/main/libs/lume) - Virtualization framework for macOS
 
-> **Note**: The cirun-agent automatically manages the Lume process, so there's no need to install or configure Lume separately. The agent handles all interactions with Lume internally.
+> **Note**: The agent automatically downloads and manages the VM platform, so there's no need to install Lume or Meda separately.
 
 ## 💡 Usage Scenarios
 
@@ -88,7 +115,7 @@ cirun-agent --api-token YOUR_API_TOKEN --interval 30
 
 ### Custom Runner Templates
 
-1. Create a VM named `cirun-runner-template` using Lume
+1. Create a VM named `cirun-runner-template` using Lume (macOS) or Meda (Linux)
 2. Configure it with your required tools and settings
 3. Start the agent - it will clone this template when provisioning new runners
 
@@ -97,7 +124,7 @@ cirun-agent --api-token YOUR_API_TOKEN --interval 30
 The agent works by:
 1. Registering itself with the Cirun API using a persistent UUID
 2. Polling the API at regular intervals for runner provisioning/deletion requests
-3. Using Lume to clone VMs from a template and run provisioning scripts
+3. Using Lume (macOS) or Meda (Linux) to clone VMs from a template and run provisioning scripts
 4. Reporting VM status back to the Cirun platform
 
 ## 👨‍💻 Development
@@ -105,7 +132,7 @@ The agent works by:
 ### Prerequisites
 
 - Rust 1.54 or later
-- Access to Lume virtualization
+- Virtualization support (KVM for Linux, Virtualization.framework for macOS)
 - Cirun API credentials
 
 ### Building
