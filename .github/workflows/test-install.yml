@@ -1,0 +1,69 @@
+name: Test Service Installation
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-install:
+    name: Test Install on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+      fail-fast: false
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Build cirun-agent
+        run: cargo build --release
+
+      - name: Run linting
+        run: |
+          cargo fmt --check
+          cargo clippy --release -- -D warnings
+
+      - name: Test install command
+        run: |
+          if [ "$RUNNER_OS" == "Linux" ]; then
+            sudo ./target/release/cirun-agent --api-token test-token-123 --install-service
+          else
+            ./target/release/cirun-agent --api-token test-token-123 --install-service
+          fi
+
+      - name: Verify service installation
+        run: |
+          if [ "$RUNNER_OS" == "Linux" ]; then
+            test -f /etc/systemd/system/cirun-agent.service || exit 1
+            systemctl is-enabled cirun-agent || exit 1
+            systemctl is-active cirun-agent || exit 1
+            echo "✅ Ubuntu service installation test passed"
+          else
+            test -f "$HOME/Library/LaunchAgents/io.cirun.agent.plist" || exit 1
+            launchctl list | grep io.cirun.agent || exit 1
+            echo "✅ macOS service installation test passed"
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: |
+          if [ "$RUNNER_OS" == "Linux" ]; then
+            sudo systemctl stop cirun-agent || true
+            sudo systemctl disable cirun-agent || true
+            sudo rm /etc/systemd/system/cirun-agent.service || true
+          else
+            launchctl unload "$HOME/Library/LaunchAgents/io.cirun.agent.plist" || true
+            rm "$HOME/Library/LaunchAgents/io.cirun.agent.plist" || true
+          fi
+
+      - name: Test help command
+        run: ./target/release/cirun-agent --help
