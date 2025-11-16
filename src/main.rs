@@ -238,6 +238,36 @@ impl CirunClient {
             .header("X-Agent-ID", &self.agent.id)
     }
 
+    async fn handle_orphaned_runners(&self, response: reqwest::Response) {
+        // Parse response for runners_to_delete (orphaned VMs)
+        match response.json::<ApiResponse>().await {
+            Ok(api_response) => {
+                if !api_response.runners_to_delete.is_empty() {
+                    info!(
+                        "API returned {} orphaned runners to delete from POST",
+                        api_response.runners_to_delete.len()
+                    );
+                    for runner in &api_response.runners_to_delete {
+                        match self.delete_runner(&runner.name).await {
+                            Ok(_) => {
+                                info!("✅ Successfully deleted orphaned runner: {}", runner.name);
+                            }
+                            Err(e) => {
+                                error!("❌ Failed to delete orphaned runner {}: {}", runner.name, e)
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                info!(
+                    "No runners_to_delete in POST response or parse error: {}",
+                    e
+                );
+            }
+        }
+    }
+
     async fn report_running_vms(&self) {
         info!("Reporting running VMs to API");
 
@@ -277,6 +307,7 @@ impl CirunClient {
                                             info!("Response received with request ID: {}", id);
                                         }
                                     }
+                                    self.handle_orphaned_runners(response).await;
                                 }
                                 Err(e) => error!("Failed to send running VMs: {}", e),
                             }
@@ -323,6 +354,7 @@ impl CirunClient {
                                             info!("Response received with request ID: {}", id);
                                         }
                                     }
+                                    self.handle_orphaned_runners(response).await;
                                 }
                                 Err(e) => error!("Failed to send running VMs: {}", e),
                             }
