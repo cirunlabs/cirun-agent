@@ -80,10 +80,17 @@ struct TemplateConfig {
     os: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct RunnerLogin {
     username: String,
     password: String,
+}
+
+#[derive(Debug, Clone)]
+struct RunnerResources {
+    cpu: u32,
+    memory: u32,
+    disk: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -334,13 +341,17 @@ impl CirunClient {
         provision_script: &str,
         template_name: &str,
         runner_login: &RunnerLogin,
-        cpu: u32,
-        memory: u32,
-        disk: u32,
+        resources: &RunnerResources,
     ) -> Result<(), Box<dyn std::error::Error>> {
         if use_meda() {
-            self.provision_runner_meda(runner_name, provision_script, template_name, runner_login, cpu, memory, disk)
-                .await
+            self.provision_runner_meda(
+                runner_name,
+                provision_script,
+                template_name,
+                runner_login,
+                resources,
+            )
+            .await
         } else {
             self.provision_runner_lume(runner_name, provision_script, template_name, runner_login)
                 .await
@@ -458,9 +469,7 @@ impl CirunClient {
         provision_script: &str,
         image: &str,
         runner_login: &RunnerLogin,
-        cpu: u32,
-        memory: u32,
-        disk: u32,
+        resources: &RunnerResources,
     ) -> Result<(), Box<dyn std::error::Error>> {
         use crate::meda::models::VmRunRequest;
 
@@ -476,7 +485,10 @@ impl CirunClient {
                             );
                             // Still try to run provisioning script
                         } else {
-                            info!("VM '{}' exists but is not running. Starting it...", runner_name);
+                            info!(
+                                "VM '{}' exists but is not running. Starting it...",
+                                runner_name
+                            );
                             meda.start_vm(runner_name).await?;
                         }
                     }
@@ -491,9 +503,9 @@ impl CirunClient {
                         let run_request = VmRunRequest {
                             image: image.to_string(),
                             name: Some(runner_name.to_string()),
-                            memory: Some(format!("{}G", memory)),
-                            cpus: Some(cpu),
-                            disk_size: Some(format!("{}G", disk)),
+                            memory: Some(format!("{}G", resources.memory)),
+                            cpus: Some(resources.cpu),
+                            disk_size: Some(format!("{}G", resources.disk)),
                         };
 
                         match meda.run_vm(run_request).await {
@@ -524,10 +536,6 @@ impl CirunClient {
 
                 info!("VM '{}' has IP address: {}", runner_name, ip_address);
 
-                // Read SSH credentials
-                let username = runner_login.username.clone();
-                let password = runner_login.password.clone();
-
                 info!("Provisioning runner: {}", runner_name);
                 info!("Running provision script on VM");
 
@@ -538,9 +546,7 @@ impl CirunClient {
                     runner_name,
                     &ip_address,
                     provision_script,
-                    &username,
-                    &password,
-                    20,
+                    runner_login,
                     true,
                 )
                 .await
@@ -569,18 +575,16 @@ impl CirunClient {
                 Ok(meda) => {
                     info!("Attempting to delete runner VM: {}", runner_name);
                     match meda.get_vm(runner_name).await {
-                        Ok(_) => {
-                            match meda.delete_vm(runner_name).await {
-                                Ok(_) => {
-                                    info!("Successfully deleted runner VM: {}", runner_name);
-                                    Ok(())
-                                }
-                                Err(e) => {
-                                    error!("Failed to delete runner VM {}: {:?}", runner_name, e);
-                                    Err(format!("Failed to delete VM: {:?}", e).into())
-                                }
+                        Ok(_) => match meda.delete_vm(runner_name).await {
+                            Ok(_) => {
+                                info!("Successfully deleted runner VM: {}", runner_name);
+                                Ok(())
                             }
-                        }
+                            Err(e) => {
+                                error!("Failed to delete runner VM {}: {:?}", runner_name, e);
+                                Err(format!("Failed to delete VM: {:?}", e).into())
+                            }
+                        },
                         Err(e) => {
                             warn!(
                                 "VM '{}' not found or error retrieving VM details: {:?}",
@@ -703,12 +707,14 @@ impl CirunClient {
 
                 // For meda (Linux), use the image name directly. Templates are only for lume (macOS).
                 let template_name = if use_meda() {
-                    info!("Using meda on Linux - using image name directly: {}", runner.os);
+                    info!(
+                        "Using meda on Linux - using image name directly: {}",
+                        runner.os
+                    );
                     runner.os.clone()
                 } else {
                     // For lume (macOS), try to find an existing template with matching configuration
-                    if let Some(existing_template) =
-                        find_matching_template(&template_config).await
+                    if let Some(existing_template) = find_matching_template(&template_config).await
                     {
                         info!(
                             "Found existing template with matching configuration: {}",
@@ -733,7 +739,10 @@ impl CirunClient {
                                     generated_name
                                 }
                                 Err(e) => {
-                                    error!("❌ Failed to create template {}: {}", generated_name, e);
+                                    error!(
+                                        "❌ Failed to create template {}: {}",
+                                        generated_name, e
+                                    );
                                     // If template creation fails, fall back to default template
                                     info!("Falling back to default template due to template creation failure");
                                     "cirun-runner-template".to_string()
@@ -752,15 +761,19 @@ impl CirunClient {
                     runner.name, template_name
                 );
 
+                let resources = RunnerResources {
+                    cpu: runner.cpu,
+                    memory: runner.memory,
+                    disk: runner.disk,
+                };
+
                 match self
                     .provision_runner(
                         &runner.name,
                         &runner.provision_script,
                         &template_name,
                         &runner.login,
-                        runner.cpu,
-                        runner.memory,
-                        runner.disk,
+                        &resources,
                     )
                     .await
                 {
@@ -789,9 +802,7 @@ impl CirunClient {
                                     &runner.provision_script,
                                     "cirun-runner-template",
                                     &runner.login,
-                                    runner.cpu,
-                                    runner.memory,
-                                    runner.disk,
+                                    &resources,
                                 )
                                 .await
                             {
@@ -822,9 +833,7 @@ async fn run_script_on_vm_meda(
     vm_name: &str,
     ip_address: &str,
     script_content: &str,
-    username: &str,
-    password: &str,
-    _timeout_seconds: u64,
+    login: &RunnerLogin,
     run_detached: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
     use std::fs::{remove_file, File};
@@ -852,7 +861,7 @@ async fn run_script_on_vm_meda(
     ));
 
     let mut file = File::create(&password_file_path)?;
-    file.write_all(password.as_bytes())?;
+    file.write_all(login.password.as_bytes())?;
 
     // Restrict permissions on the password file
     #[cfg(unix)]
@@ -888,19 +897,27 @@ async fn run_script_on_vm_meda(
             .arg(&password_file_str)
             .arg("ssh")
             .args(&ssh_options)
-            .arg(format!("{}@{}", username, ip_address))
+            .arg(format!("{}@{}", login.username, ip_address))
             .arg("echo 'SSH connection test successful'")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()?;
 
         if output.status.success() {
-            info!("✔ SSH connection successful (attempt {}/{})", attempt, max_ssh_retries);
+            info!(
+                "✔ SSH connection successful (attempt {}/{})",
+                attempt, max_ssh_retries
+            );
             ssh_ready = true;
             break;
         } else {
             let error_msg = String::from_utf8_lossy(&output.stderr);
-            info!("SSH not ready yet (attempt {}/{}): {}", attempt, max_ssh_retries, error_msg.trim());
+            info!(
+                "SSH not ready yet (attempt {}/{}): {}",
+                attempt,
+                max_ssh_retries,
+                error_msg.trim()
+            );
             if attempt < max_ssh_retries {
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
             }
@@ -909,7 +926,9 @@ async fn run_script_on_vm_meda(
 
     if !ssh_ready {
         remove_file(&password_file_path).ok();
-        return Err("SSH connection failed after multiple retries - VM may not be fully booted".into());
+        return Err(
+            "SSH connection failed after multiple retries - VM may not be fully booted".into(),
+        );
     }
 
     // Step 5: Copy the script to the VM
@@ -924,7 +943,7 @@ async fn run_script_on_vm_meda(
         .arg(temp_file_path)
         .arg(format!(
             "{}@{}:{}",
-            username, ip_address, remote_script_path
+            login.username, ip_address, remote_script_path
         ))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -946,7 +965,7 @@ async fn run_script_on_vm_meda(
             .arg(&password_file_str)
             .arg("ssh")
             .args(&ssh_options)
-            .arg(format!("{}@{}", username, ip_address))
+            .arg(format!("{}@{}", login.username, ip_address))
             .arg(format!(
                 "chmod +x {} && sudo nohup bash {} > /tmp/script_stdout.log 2> /tmp/script_stderr.log & echo $!",
                 remote_script_path, remote_script_path
@@ -961,7 +980,7 @@ async fn run_script_on_vm_meda(
             .arg(&password_file_str)
             .arg("ssh")
             .args(&ssh_options)
-            .arg(format!("{}@{}", username, ip_address))
+            .arg(format!("{}@{}", login.username, ip_address))
             .arg(format!(
                 "chmod +x {} && sudo bash {}",
                 remote_script_path, remote_script_path
@@ -1016,7 +1035,7 @@ async fn main() {
     // Download and run the appropriate VM manager based on platform
     if use_meda() {
         info!("Detected Linux platform - using Meda for VM management");
-        meda::download_and_run_meda().await;
+        meda::setup::download_and_run_meda().await;
         log_dir = PathBuf::from(&home_dir).join(".meda/logs");
 
         info!("Checking Meda connectivity...");
@@ -1025,10 +1044,7 @@ async fn main() {
                 Ok(vms) => {
                     info!("✅ Successfully connected to Meda. Found {} VMs", vms.len());
                     for vm in vms {
-                        info!(
-                            "- {} ({})",
-                            vm.name, vm.state
-                        );
+                        info!("- {} ({})", vm.name, vm.state);
                     }
                 }
                 Err(e) => {

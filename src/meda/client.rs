@@ -4,11 +4,13 @@ use reqwest::Client;
 use std::time::Duration;
 
 use crate::meda::errors::MedaError;
-use crate::meda::models::{VmCreateRequest, VmDetailResponse, VmInfo, VmListResponse, VmRunRequest};
+use crate::meda::models::{
+    VmCreateRequest, VmDetailResponse, VmInfo, VmListResponse, VmRunRequest,
+};
 
 const DEFAULT_API_URL: &str = "http://127.0.0.1:7777/api/v1";
-const CONNECT_TIMEOUT: u64 = 6000;
-const MAX_TIMEOUT: u64 = 5000;
+const CONNECT_TIMEOUT: u64 = 10; // 10 seconds
+const MAX_TIMEOUT: u64 = 300; // 5 minutes
 
 pub struct MedaClient {
     client: Client,
@@ -20,6 +22,7 @@ impl MedaClient {
         Self::with_base_url(DEFAULT_API_URL)
     }
 
+    #[allow(dead_code)]
     pub fn get_base_url(&self) -> &str {
         &self.base_url
     }
@@ -41,6 +44,7 @@ impl MedaClient {
     }
 
     /// Create a new VM
+    #[allow(dead_code)]
     pub async fn create_vm(&self, config: VmCreateRequest) -> Result<(), MedaError> {
         let url = format!("{}/vms", self.base_url);
 
@@ -120,6 +124,7 @@ impl MedaClient {
     }
 
     /// Stop a running VM
+    #[allow(dead_code)]
     pub async fn stop_vm(&self, name: &str) -> Result<(), MedaError> {
         let url = format!("{}/vms/{}/stop", self.base_url, name);
 
@@ -148,31 +153,30 @@ impl MedaClient {
 
         info!("Deleting VM {}", name);
 
-        let send_delete_request = || async {
-            let response = self
-                .client
-                .delete(&url)
-                .send()
-                .await
-                .map_err(|e| MedaError::ApiError(format!("HTTP request failed: {:?}", e)))?;
+        let send_delete_request =
+            || async {
+                let response =
+                    self.client.delete(&url).send().await.map_err(|e| {
+                        MedaError::ApiError(format!("HTTP request failed: {:?}", e))
+                    })?;
 
-            let status = response.status();
-            let response_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
+                let status = response.status();
+                let response_text = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "Unknown error".to_string());
 
-            info!("Delete operation response status: {}", status);
-            info!("Delete operation response body: {}", response_text);
+                info!("Delete operation response status: {}", status);
+                info!("Delete operation response body: {}", response_text);
 
-            if !status.is_success() {
-                return Err(MedaError::ApiError(format!(
-                    "Failed to delete VM: {}",
-                    response_text
-                )));
-            }
-            Ok(())
-        };
+                if !status.is_success() {
+                    return Err(MedaError::ApiError(format!(
+                        "Failed to delete VM: {}",
+                        response_text
+                    )));
+                }
+                Ok(())
+            };
 
         // Retry logic with proper error conversion
         send_delete_request

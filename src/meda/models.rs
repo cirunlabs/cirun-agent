@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct VmCreateRequest {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
