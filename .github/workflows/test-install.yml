@@ -1,0 +1,110 @@
+name: Test Service Installation
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-install:
+    name: Test Install on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+      fail-fast: false
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Build cirun-agent
+        run: cargo build --release
+
+      - name: Run linting
+        run: |
+          cargo fmt --check
+          cargo clippy --release -- -D warnings
+
+      - name: Test install command
+        run: |
+          if [ "$RUNNER_OS" == "Linux" ]; then
+            sudo ./target/release/cirun-agent --api-token test-token-123 --install-service
+          else
+            ./target/release/cirun-agent --api-token test-token-123 --install-service
+          fi
+
+      - name: Verify service installation
+        run: |
+          if [ "$RUNNER_OS" == "Linux" ]; then
+            test -f /etc/systemd/system/cirun-agent.service || exit 1
+            systemctl is-enabled cirun-agent || exit 1
+            systemctl is-active cirun-agent || exit 1
+            echo "✅ Ubuntu service installation test passed"
+          else
+            test -f "$HOME/Library/LaunchAgents/io.cirun.agent.plist" || exit 1
+            launchctl list | grep io.cirun.agent || exit 1
+            echo "✅ macOS service installation test passed"
+          fi
+
+      - name: Show service logs
+        run: |
+          echo "Waiting for service to start..."
+          sleep 5
+
+          if [ "$RUNNER_OS" == "Linux" ]; then
+            echo "=== Systemd service logs ==="
+            sudo journalctl -u cirun-agent --no-pager -n 50
+          else
+            echo "=== Launchd service logs ==="
+            if [ -f "$HOME/Library/Logs/cirun-agent.log" ]; then
+              cat "$HOME/Library/Logs/cirun-agent.log"
+            else
+              echo "Log file not found yet"
+            fi
+            if [ -f "$HOME/Library/Logs/cirun-agent.error.log" ]; then
+              echo "=== Error logs ==="
+              cat "$HOME/Library/Logs/cirun-agent.error.log"
+            fi
+          fi
+
+      - name: Test reinstall (should handle existing service)
+        run: |
+          echo "Testing reinstall with different interval..."
+          if [ "$RUNNER_OS" == "Linux" ]; then
+            sudo ./target/release/cirun-agent --api-token test-token-456 --interval 10 --install-service
+          else
+            ./target/release/cirun-agent --api-token test-token-456 --interval 10 --install-service
+          fi
+
+      - name: Verify service is still running after reinstall
+        run: |
+          sleep 3
+          if [ "$RUNNER_OS" == "Linux" ]; then
+            systemctl is-active cirun-agent || exit 1
+            echo "✅ Service still running after reinstall"
+          else
+            launchctl list | grep io.cirun.agent || exit 1
+            echo "✅ Service still running after reinstall"
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: |
+          if [ "$RUNNER_OS" == "Linux" ]; then
+            sudo systemctl stop cirun-agent || true
+            sudo systemctl disable cirun-agent || true
+            sudo rm /etc/systemd/system/cirun-agent.service || true
+          else
+            launchctl unload "$HOME/Library/LaunchAgents/io.cirun.agent.plist" || true
+            rm "$HOME/Library/LaunchAgents/io.cirun.agent.plist" || true
+          fi
+
+      - name: Test help command
+        run: ./target/release/cirun-agent --help
