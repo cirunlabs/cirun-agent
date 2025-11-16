@@ -883,6 +883,9 @@ fn install_service(args: &Args) {
 
     if cfg!(target_os = "linux") {
         // Create systemd service file
+        // Get the home directory for the service
+        let home_dir = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+
         let service_content = format!(
             r#"[Unit]
 Description=Cirun Agent for On-Prem Runner Management
@@ -891,6 +894,7 @@ After=network.target
 [Service]
 Type=simple
 ExecStart={}
+Environment="HOME={}"
 Restart=always
 RestartSec=10
 StandardOutput=journal
@@ -899,7 +903,7 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 "#,
-            cmd
+            cmd, home_dir
         );
 
         let service_path = "/etc/systemd/system/cirun-agent.service";
