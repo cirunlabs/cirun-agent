@@ -882,6 +882,18 @@ fn install_service(args: &Args) {
     }
 
     if cfg!(target_os = "linux") {
+        // Check if service already exists and stop it first
+        let service_path = "/etc/systemd/system/cirun-agent.service";
+        if std::path::Path::new(service_path).exists() {
+            println!("Found existing cirun-agent service, stopping it...");
+            let _ = std::process::Command::new("systemctl")
+                .args(["stop", "cirun-agent"])
+                .status();
+            let _ = std::process::Command::new("systemctl")
+                .args(["disable", "cirun-agent"])
+                .status();
+        }
+
         // Create systemd service file
         // Get the home directory for the service
         let home_dir = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
@@ -937,6 +949,16 @@ WantedBy=multi-user.target
         // Create launchd plist
         let home_dir = std::env::var("HOME").expect("Failed to get HOME directory");
         let plist_dir = format!("{}/Library/LaunchAgents", home_dir);
+        let plist_path = format!("{}/io.cirun.agent.plist", plist_dir);
+
+        // Check if service already exists and unload it first
+        if std::path::Path::new(&plist_path).exists() {
+            println!("Found existing cirun-agent service, unloading it...");
+            let _ = std::process::Command::new("launchctl")
+                .args(["unload", &plist_path])
+                .status();
+        }
+
         fs::create_dir_all(&plist_dir).expect("Failed to create LaunchAgents directory");
 
         let plist_content = format!(
@@ -977,7 +999,6 @@ WantedBy=multi-user.target
             home_dir
         );
 
-        let plist_path = format!("{}/io.cirun.agent.plist", plist_dir);
         fs::write(&plist_path, plist_content).expect("Failed to write launchd plist");
         println!("✅ Created launchd plist at {}", plist_path);
 

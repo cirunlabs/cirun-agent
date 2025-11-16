@@ -74,6 +74,26 @@ jobs:
             fi
           fi
 
+      - name: Test reinstall (should handle existing service)
+        run: |
+          echo "Testing reinstall with different interval..."
+          if [ "$RUNNER_OS" == "Linux" ]; then
+            sudo ./target/release/cirun-agent --api-token test-token-456 --interval 10 --install-service
+          else
+            ./target/release/cirun-agent --api-token test-token-456 --interval 10 --install-service
+          fi
+
+      - name: Verify service is still running after reinstall
+        run: |
+          sleep 3
+          if [ "$RUNNER_OS" == "Linux" ]; then
+            systemctl is-active cirun-agent || exit 1
+            echo "✅ Service still running after reinstall"
+          else
+            launchctl list | grep io.cirun.agent || exit 1
+            echo "✅ Service still running after reinstall"
+          fi
+
       - name: Cleanup
         if: always()
         run: |
