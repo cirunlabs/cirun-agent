@@ -53,6 +53,27 @@ jobs:
             echo "✅ macOS service installation test passed"
           fi
 
+      - name: Show service logs
+        run: |
+          echo "Waiting for service to start..."
+          sleep 5
+
+          if [ "$RUNNER_OS" == "Linux" ]; then
+            echo "=== Systemd service logs ==="
+            sudo journalctl -u cirun-agent --no-pager -n 50
+          else
+            echo "=== Launchd service logs ==="
+            if [ -f "$HOME/Library/Logs/cirun-agent.log" ]; then
+              cat "$HOME/Library/Logs/cirun-agent.log"
+            else
+              echo "Log file not found yet"
+            fi
+            if [ -f "$HOME/Library/Logs/cirun-agent.error.log" ]; then
+              echo "=== Error logs ==="
+              cat "$HOME/Library/Logs/cirun-agent.error.log"
+            fi
+          fi
+
       - name: Cleanup
         if: always()
         run: |

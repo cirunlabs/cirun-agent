@@ -863,7 +863,6 @@ impl CirunClient {
     }
 }
 
-// Helper function for running scripts on VMs using meda (simpler version without lume client)
 fn install_service(args: &Args) {
     use std::fs;
 
@@ -998,6 +997,7 @@ WantedBy=multi-user.target
     }
 }
 
+// Helper function for running scripts on VMs using meda (simpler version without lume client)
 async fn run_script_on_vm_meda(
     _meda: &MedaClient,
     vm_name: &str,
