@@ -7,8 +7,8 @@ use crate::lume::errors::LumeError;
 use crate::lume::models::{CloneConfig, RunConfig, VmConfig, VmInfo};
 
 const DEFAULT_API_URL: &str = "http://127.0.0.1:3000/lume";
-const CONNECT_TIMEOUT: u64 = 6000;
-const MAX_TIMEOUT: u64 = 5000;
+const CONNECT_TIMEOUT: u64 = 10; // 10 seconds
+const MAX_TIMEOUT: u64 = 300; // 5 minutes
 
 pub struct LumeClient {
     client: Client,

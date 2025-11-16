@@ -1,11 +1,14 @@
 mod lume;
+mod meda;
 mod vm_provision;
 
 use crate::lume::client::LumeClient;
-use crate::lume::setup::cleanup_log_files;
+use crate::lume::setup::cleanup_log_files as cleanup_lume_logs;
 use crate::lume::{
     check_template_exists, create_template, find_matching_template, generate_template_name,
 };
+use crate::meda::client::MedaClient;
+use crate::meda::setup::cleanup_log_files as cleanup_meda_logs;
 use crate::vm_provision::run_script_on_vm;
 use clap::Parser;
 use log::{debug, error, info, warn};
@@ -77,10 +80,17 @@ struct TemplateConfig {
     os: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct RunnerLogin {
     username: String,
     password: String,
+}
+
+#[derive(Debug, Clone)]
+struct RunnerResources {
+    cpu: u32,
+    memory: u32,
+    disk: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -90,6 +100,7 @@ struct RunnerToProvision {
     os: String, // This is actually the image to use
     cpu: u32,
     memory: u32,
+    #[serde(default)]
     disk: u32,
     login: RunnerLogin,
 }
@@ -106,6 +117,11 @@ struct CommandResponse {
     output: String,
     error: String,
     agent: AgentInfo,
+}
+
+// Helper function to determine if we should use meda (Linux host) or lume (macOS host)
+fn use_meda() -> bool {
+    env::consts::OS == "linux"
 }
 
 // Helper function to determine OS from image name
@@ -224,53 +240,125 @@ impl CirunClient {
 
     async fn report_running_vms(&self) {
         info!("Reporting running VMs to API");
-        match LumeClient::new() {
-            Ok(lume) => {
-                match lume.list_vms().await {
-                    Ok(vms) => {
-                        let running_vms: Vec<_> =
-                            vms.into_iter().filter(|vm| vm.state == "running").collect();
-                        let url = format!("{}/agent", self.base_url);
 
-                        // Use the helper method instead of direct client access
-                        let res = self
-                            .create_request(reqwest::Method::POST, &url)
-                            .json(&json!({
-                                "agent": self.agent,
-                                "running_vms": running_vms.iter().map(|vm| {
-                                    json!({
-                                        "name": vm.name,
-                                        "os": vm.os,
-                                        "cpu": vm.cpu,
-                                        "memory": vm.memory,
-                                        "disk_size": vm.disk_size.total
-                                    })
-                                }).collect::<Vec<_>>()
-                            }))
-                            .send()
-                            .await;
+        if use_meda() {
+            // Use meda for Linux
+            match MedaClient::new() {
+                Ok(meda) => {
+                    match meda.list_vms().await {
+                        Ok(vms) => {
+                            let running_vms: Vec<_> =
+                                vms.into_iter().filter(|vm| vm.state == "running").collect();
+                            let url = format!("{}/agent", self.base_url);
 
-                        match res {
-                            Ok(response) => {
-                                let status = response.status();
-                                info!("API response status: {}", status);
-                                if let Some(req_id) = response.headers().get("X-Request-ID") {
-                                    if let Ok(id) = req_id.to_str() {
-                                        info!("Response received with request ID: {}", id);
+                            let res = self
+                                .create_request(reqwest::Method::POST, &url)
+                                .json(&json!({
+                                    "agent": self.agent,
+                                    "running_vms": running_vms.iter().map(|vm| {
+                                        json!({
+                                            "name": vm.name,
+                                            "os": "linux",
+                                            "cpu": vm.cpus.unwrap_or(2),
+                                            "memory": vm.memory.as_ref().and_then(|m| m.trim_end_matches("GB").trim_end_matches("G").parse::<u64>().ok()).unwrap_or(2048),
+                                            "disk_size": 0  // Meda doesn't report disk size in list
+                                        })
+                                    }).collect::<Vec<_>>()
+                                }))
+                                .send()
+                                .await;
+
+                            match res {
+                                Ok(response) => {
+                                    let status = response.status();
+                                    info!("API response status: {}", status);
+                                    if let Some(req_id) = response.headers().get("X-Request-ID") {
+                                        if let Ok(id) = req_id.to_str() {
+                                            info!("Response received with request ID: {}", id);
+                                        }
                                     }
                                 }
+                                Err(e) => error!("Failed to send running VMs: {}", e),
                             }
-                            Err(e) => error!("Failed to send running VMs: {}", e),
                         }
+                        Err(e) => error!("Failed to list VMs: {:?}", e),
                     }
-                    Err(e) => error!("Failed to list VMs: {:?}", e),
                 }
+                Err(e) => error!("Failed to initialize Meda client: {:?}", e),
             }
-            Err(e) => error!("Failed to initialize Lume client: {:?}", e),
+        } else {
+            // Use lume for macOS
+            match LumeClient::new() {
+                Ok(lume) => {
+                    match lume.list_vms().await {
+                        Ok(vms) => {
+                            let running_vms: Vec<_> =
+                                vms.into_iter().filter(|vm| vm.state == "running").collect();
+                            let url = format!("{}/agent", self.base_url);
+
+                            // Use the helper method instead of direct client access
+                            let res = self
+                                .create_request(reqwest::Method::POST, &url)
+                                .json(&json!({
+                                    "agent": self.agent,
+                                    "running_vms": running_vms.iter().map(|vm| {
+                                        json!({
+                                            "name": vm.name,
+                                            "os": vm.os,
+                                            "cpu": vm.cpu,
+                                            "memory": vm.memory,
+                                            "disk_size": vm.disk_size.total
+                                        })
+                                    }).collect::<Vec<_>>()
+                                }))
+                                .send()
+                                .await;
+
+                            match res {
+                                Ok(response) => {
+                                    let status = response.status();
+                                    info!("API response status: {}", status);
+                                    if let Some(req_id) = response.headers().get("X-Request-ID") {
+                                        if let Ok(id) = req_id.to_str() {
+                                            info!("Response received with request ID: {}", id);
+                                        }
+                                    }
+                                }
+                                Err(e) => error!("Failed to send running VMs: {}", e),
+                            }
+                        }
+                        Err(e) => error!("Failed to list VMs: {:?}", e),
+                    }
+                }
+                Err(e) => error!("Failed to initialize Lume client: {:?}", e),
+            }
         }
     }
 
     async fn provision_runner(
+        &self,
+        runner_name: &str,
+        provision_script: &str,
+        template_name: &str,
+        runner_login: &RunnerLogin,
+        resources: &RunnerResources,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if use_meda() {
+            self.provision_runner_meda(
+                runner_name,
+                provision_script,
+                template_name,
+                runner_login,
+                resources,
+            )
+            .await
+        } else {
+            self.provision_runner_lume(runner_name, provision_script, template_name, runner_login)
+                .await
+        }
+    }
+
+    async fn provision_runner_lume(
         &self,
         runner_name: &str,
         provision_script: &str,
@@ -375,43 +463,181 @@ impl CirunClient {
         }
     }
 
-    async fn delete_runner(&self, runner_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-        match LumeClient::new() {
-            Ok(lume) => {
-                info!("Attempting to delete runner VM: {}", runner_name);
+    async fn provision_runner_meda(
+        &self,
+        runner_name: &str,
+        provision_script: &str,
+        image: &str,
+        runner_login: &RunnerLogin,
+        resources: &RunnerResources,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::meda::models::VmRunRequest;
 
-                // Check if VM exists by trying to get its details
-                match lume.get_vm(runner_name).await {
-                    Ok(vm) => {
-                        info!("Found VM '{}' with status: {}", runner_name, vm.state);
+        match MedaClient::new() {
+            Ok(meda) => {
+                // Check if VM already exists
+                match meda.get_vm(runner_name).await {
+                    Ok(vm_info) => {
+                        if vm_info.state == "running" {
+                            info!(
+                                "VM '{}' already exists and is running. Skipping creation.",
+                                runner_name
+                            );
+                            // Still try to run provisioning script
+                        } else {
+                            info!(
+                                "VM '{}' exists but is not running. Starting it...",
+                                runner_name
+                            );
+                            meda.start_vm(runner_name).await?;
+                        }
+                    }
+                    Err(_) => {
+                        // VM doesn't exist, create and run it from image
+                        info!(
+                            "VM '{}' does not exist. Creating from image '{}'...",
+                            runner_name, image
+                        );
 
-                        // Delete the VM
-                        match lume.delete_vm(runner_name).await {
+                        // For meda, we use the image name directly (template_name parameter contains the image)
+                        let run_request = VmRunRequest {
+                            image: image.to_string(),
+                            name: Some(runner_name.to_string()),
+                            memory: Some(format!("{}G", resources.memory)),
+                            cpus: Some(resources.cpu),
+                            disk_size: Some(format!("{}G", resources.disk)),
+                        };
+
+                        match meda.run_vm(run_request).await {
                             Ok(_) => {
-                                info!("VM '{}' deleted successfully", runner_name);
-                                Ok(())
+                                info!("VM '{}' created and started successfully", runner_name);
                             }
                             Err(e) => {
-                                error!("Failed to delete VM '{}': {:?}", runner_name, e);
-                                Err(format!("Failed to delete VM '{}': {:?}", runner_name, e)
-                                    .into())
+                                error!("Failed to create and run VM '{}': {:?}", runner_name, e);
+                                return Err(format!(
+                                    "Failed to create and run VM from image '{}': {:?}",
+                                    image, e
+                                )
+                                .into());
                             }
                         }
                     }
+                }
+
+                // Wait for VM to get an IP address
+                info!("Waiting for VM '{}' to get an IP address...", runner_name);
+                let ip_address = match meda.wait_for_vm_ip(runner_name, 300).await {
+                    Ok(ip) => ip,
                     Err(e) => {
-                        warn!(
-                            "VM '{}' not found or error retrieving VM details: {:?}",
-                            runner_name, e
-                        );
-                        // Consider this a success since the VM doesn't exist anyway
-                        info!("VM '{}' doesn't exist or can't be accessed - considering delete successful", runner_name);
+                        error!("Failed to get VM IP address: {:?}", e);
+                        return Err(e.into());
+                    }
+                };
+
+                info!("VM '{}' has IP address: {}", runner_name, ip_address);
+
+                info!("Provisioning runner: {}", runner_name);
+                info!("Running provision script on VM");
+
+                // For meda, we need to use a simplified approach since we don't have the lume client
+                // We'll use run_script_on_vm but we need to adapt it for meda
+                match run_script_on_vm_meda(
+                    &meda,
+                    runner_name,
+                    &ip_address,
+                    provision_script,
+                    runner_login,
+                    true,
+                )
+                .await
+                {
+                    Ok(output) => {
+                        info!("Runner provisioning completed successfully");
+                        info!("Script output: {}", output);
                         Ok(())
+                    }
+                    Err(e) => {
+                        error!("Failed to provision runner: {}", e);
+                        Err(e)
                     }
                 }
             }
             Err(e) => {
-                error!("Failed to initialize Lume client: {:?}", e);
+                error!("Failed to initialize Meda client: {:?}", e);
                 Err(e.into())
+            }
+        }
+    }
+
+    async fn delete_runner(&self, runner_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+        if use_meda() {
+            match MedaClient::new() {
+                Ok(meda) => {
+                    info!("Attempting to delete runner VM: {}", runner_name);
+                    match meda.get_vm(runner_name).await {
+                        Ok(_) => match meda.delete_vm(runner_name).await {
+                            Ok(_) => {
+                                info!("Successfully deleted runner VM: {}", runner_name);
+                                Ok(())
+                            }
+                            Err(e) => {
+                                error!("Failed to delete runner VM {}: {:?}", runner_name, e);
+                                Err(format!("Failed to delete VM: {:?}", e).into())
+                            }
+                        },
+                        Err(e) => {
+                            warn!(
+                                "VM '{}' not found or error retrieving VM details: {:?}",
+                                runner_name, e
+                            );
+                            info!("VM '{}' doesn't exist or can't be accessed - considering delete successful", runner_name);
+                            Ok(())
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to initialize Meda client: {:?}", e);
+                    Err(e.into())
+                }
+            }
+        } else {
+            match LumeClient::new() {
+                Ok(lume) => {
+                    info!("Attempting to delete runner VM: {}", runner_name);
+
+                    // Check if VM exists by trying to get its details
+                    match lume.get_vm(runner_name).await {
+                        Ok(vm) => {
+                            info!("Found VM '{}' with status: {}", runner_name, vm.state);
+
+                            // Delete the VM
+                            match lume.delete_vm(runner_name).await {
+                                Ok(_) => {
+                                    info!("VM '{}' deleted successfully", runner_name);
+                                    Ok(())
+                                }
+                                Err(e) => {
+                                    error!("Failed to delete VM '{}': {:?}", runner_name, e);
+                                    Err(format!("Failed to delete VM '{}': {:?}", runner_name, e)
+                                        .into())
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "VM '{}' not found or error retrieving VM details: {:?}",
+                                runner_name, e
+                            );
+                            // Consider this a success since the VM doesn't exist anyway
+                            info!("VM '{}' doesn't exist or can't be accessed - considering delete successful", runner_name);
+                            Ok(())
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to initialize Lume client: {:?}", e);
+                    Err(e.into())
+                }
             }
         }
     }
@@ -479,42 +705,53 @@ impl CirunClient {
                     os: get_os_from_image(&runner.os), // Determine OS type from image name
                 };
 
-                // First, try to find an existing template with matching configuration
-                let template_name = if let Some(existing_template) =
-                    find_matching_template(&template_config).await
-                {
+                // For meda (Linux), use the image name directly. Templates are only for lume (macOS).
+                let template_name = if use_meda() {
                     info!(
-                        "Found existing template with matching configuration: {}",
-                        existing_template
+                        "Using meda on Linux - using image name directly: {}",
+                        runner.os
                     );
-                    existing_template
+                    runner.os.clone()
                 } else {
-                    // Generate a new template name
-                    let generated_name = generate_template_name(&template_config);
-
-                    // Check if the template with this specific name already exists
-                    let template_exists = check_template_exists(&generated_name).await;
-
-                    if !template_exists {
-                        // Create the template if it doesn't exist
-                        info!("No matching template found. Creating new template '{}' from image '{}'",
-                             generated_name, template_config.image);
-
-                        match create_template(&template_config, &generated_name).await {
-                            Ok(_) => {
-                                info!("✅ Successfully created template: {}", generated_name);
-                                generated_name
-                            }
-                            Err(e) => {
-                                error!("❌ Failed to create template {}: {}", generated_name, e);
-                                // If template creation fails, fall back to default template
-                                info!("Falling back to default template due to template creation failure");
-                                "cirun-runner-template".to_string()
-                            }
-                        }
+                    // For lume (macOS), try to find an existing template with matching configuration
+                    if let Some(existing_template) = find_matching_template(&template_config).await
+                    {
+                        info!(
+                            "Found existing template with matching configuration: {}",
+                            existing_template
+                        );
+                        existing_template
                     } else {
-                        info!("Using existing template: {}", generated_name);
-                        generated_name
+                        // Generate a new template name
+                        let generated_name = generate_template_name(&template_config);
+
+                        // Check if the template with this specific name already exists
+                        let template_exists = check_template_exists(&generated_name).await;
+
+                        if !template_exists {
+                            // Create the template if it doesn't exist
+                            info!("No matching template found. Creating new template '{}' from image '{}'",
+                                 generated_name, template_config.image);
+
+                            match create_template(&template_config, &generated_name).await {
+                                Ok(_) => {
+                                    info!("✅ Successfully created template: {}", generated_name);
+                                    generated_name
+                                }
+                                Err(e) => {
+                                    error!(
+                                        "❌ Failed to create template {}: {}",
+                                        generated_name, e
+                                    );
+                                    // If template creation fails, fall back to default template
+                                    info!("Falling back to default template due to template creation failure");
+                                    "cirun-runner-template".to_string()
+                                }
+                            }
+                        } else {
+                            info!("Using existing template: {}", generated_name);
+                            generated_name
+                        }
                     }
                 };
 
@@ -524,12 +761,19 @@ impl CirunClient {
                     runner.name, template_name
                 );
 
+                let resources = RunnerResources {
+                    cpu: runner.cpu,
+                    memory: runner.memory,
+                    disk: runner.disk,
+                };
+
                 match self
                     .provision_runner(
                         &runner.name,
                         &runner.provision_script,
                         &template_name,
                         &runner.login,
+                        &resources,
                     )
                     .await
                 {
@@ -558,6 +802,7 @@ impl CirunClient {
                                     &runner.provision_script,
                                     "cirun-runner-template",
                                     &runner.login,
+                                    &resources,
                                 )
                                 .await
                             {
@@ -580,6 +825,182 @@ impl CirunClient {
 
         Ok(json)
     }
+}
+
+// Helper function for running scripts on VMs using meda (simpler version without lume client)
+async fn run_script_on_vm_meda(
+    _meda: &MedaClient,
+    vm_name: &str,
+    ip_address: &str,
+    script_content: &str,
+    login: &RunnerLogin,
+    run_detached: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    use std::fs::{remove_file, File};
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+    use tempfile::NamedTempFile;
+
+    info!("VM '{}' is ready with IP: {}", vm_name, ip_address);
+
+    // Step 1: Create a temporary file for the script
+    info!("Creating temporary script file");
+    let mut temp_file = NamedTempFile::new()?;
+    temp_file.write_all(script_content.as_bytes())?;
+    let temp_file_path = temp_file
+        .path()
+        .to_str()
+        .ok_or("Failed to get temporary file path")?;
+
+    // Step 2: Create a temporary password file for sshpass
+    let temp_dir = std::env::temp_dir();
+    let password_file_path = temp_dir.join(format!(
+        "sshpass_{}.txt",
+        Instant::now().elapsed().as_millis()
+    ));
+
+    let mut file = File::create(&password_file_path)?;
+    file.write_all(login.password.as_bytes())?;
+
+    // Restrict permissions on the password file
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = file.metadata()?;
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(&password_file_path, permissions)?;
+    }
+
+    let password_file_str = password_file_path.to_string_lossy().to_string();
+    info!("Created temporary password file for SSH authentication");
+
+    // Step 3: Setup SSH options
+    let ssh_options = vec![
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-o",
+        "ConnectTimeout=10",
+    ];
+
+    // Step 4: Test SSH connection with retries (SSH may not be ready immediately after VM boot)
+    info!("Waiting for SSH to be ready on VM (max 60 seconds)...");
+    let max_ssh_retries = 12; // 12 retries * 5 seconds = 60 seconds max
+    let mut ssh_ready = false;
+
+    for attempt in 1..=max_ssh_retries {
+        let output = Command::new("sshpass")
+            .arg("-f")
+            .arg(&password_file_str)
+            .arg("ssh")
+            .args(&ssh_options)
+            .arg(format!("{}@{}", login.username, ip_address))
+            .arg("echo 'SSH connection test successful'")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()?;
+
+        if output.status.success() {
+            info!(
+                "✔ SSH connection successful (attempt {}/{})",
+                attempt, max_ssh_retries
+            );
+            ssh_ready = true;
+            break;
+        } else {
+            let error_msg = String::from_utf8_lossy(&output.stderr);
+            info!(
+                "SSH not ready yet (attempt {}/{}): {}",
+                attempt,
+                max_ssh_retries,
+                error_msg.trim()
+            );
+            if attempt < max_ssh_retries {
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            }
+        }
+    }
+
+    if !ssh_ready {
+        remove_file(&password_file_path).ok();
+        return Err(
+            "SSH connection failed after multiple retries - VM may not be fully booted".into(),
+        );
+    }
+
+    // Step 5: Copy the script to the VM
+    let remote_script_path = format!("/tmp/script_{}.sh", Instant::now().elapsed().as_secs());
+    info!("Copying script to VM at {}", remote_script_path);
+
+    let output = Command::new("sshpass")
+        .arg("-f")
+        .arg(&password_file_str)
+        .arg("scp")
+        .args(&ssh_options)
+        .arg(temp_file_path)
+        .arg(format!(
+            "{}@{}:{}",
+            login.username, ip_address, remote_script_path
+        ))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+
+    if !output.status.success() {
+        let error_msg = String::from_utf8_lossy(&output.stderr);
+        remove_file(&password_file_path).ok();
+        return Err(format!("SCP failed: {}", error_msg).into());
+    }
+
+    info!("✔ SCP transfer successful");
+
+    // Step 6: Execute the script on the VM with sudo (provision scripts need root privileges)
+    let output = if run_detached {
+        info!("Executing script on VM in detached mode with sudo");
+        Command::new("sshpass")
+            .arg("-f")
+            .arg(&password_file_str)
+            .arg("ssh")
+            .args(&ssh_options)
+            .arg(format!("{}@{}", login.username, ip_address))
+            .arg(format!(
+                "chmod +x {} && sudo nohup bash {} > /tmp/script_stdout.log 2> /tmp/script_stderr.log & echo $!",
+                remote_script_path, remote_script_path
+            ))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()?
+    } else {
+        info!("Executing script on VM and waiting for completion with sudo");
+        Command::new("sshpass")
+            .arg("-f")
+            .arg(&password_file_str)
+            .arg("ssh")
+            .args(&ssh_options)
+            .arg(format!("{}@{}", login.username, ip_address))
+            .arg(format!(
+                "chmod +x {} && sudo bash {}",
+                remote_script_path, remote_script_path
+            ))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()?
+    };
+
+    // Step 7: Clean up password file
+    remove_file(&password_file_path).ok();
+
+    if !output.status.success() {
+        let error_msg = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Script execution failed: {}", error_msg).into());
+    }
+
+    let script_output = String::from_utf8_lossy(&output.stdout).to_string();
+    info!("Script execution completed successfully.");
+    Ok(script_output)
 }
 
 #[tokio::main]
@@ -607,34 +1028,64 @@ async fn main() {
     info!("Cirun API URL: {}", cirun_api_url);
     let client = CirunClient::new(&cirun_api_url, &args.api_token, agent_info);
 
-    // Check Lume connectivity before entering the main loop
-    lume::download_and_run_lume().await;
-    info!("Checking Lume connectivity...");
-    match LumeClient::new() {
-        Ok(lume) => match lume.list_vms().await {
-            Ok(vms) => {
-                info!("✅ Successfully connected to Lume. Found {} VMs", vms.len());
-                for vm in vms {
-                    info!(
-                        "- {} ({}, {}, CPU: {}, Memory: {}, Disk: {})",
-                        vm.name, vm.state, vm.os, vm.cpu, vm.memory, vm.disk_size.total
-                    );
+    // Set up log cleanup parameters based on platform
+    let home_dir = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let log_dir: PathBuf;
+
+    // Download and run the appropriate VM manager based on platform
+    if use_meda() {
+        info!("Detected Linux platform - using Meda for VM management");
+        meda::setup::download_and_run_meda().await;
+        log_dir = PathBuf::from(&home_dir).join(".meda/logs");
+
+        info!("Checking Meda connectivity...");
+        match MedaClient::new() {
+            Ok(meda) => match meda.list_vms().await {
+                Ok(vms) => {
+                    info!("✅ Successfully connected to Meda. Found {} VMs", vms.len());
+                    for vm in vms {
+                        info!("- {} ({})", vm.name, vm.state);
+                    }
                 }
-            }
+                Err(e) => {
+                    error!("❌ Failed to connect to Meda API: {:?}", e);
+                    error!("Agent will continue but VM operations will likely fail");
+                }
+            },
             Err(e) => {
-                error!("❌ Failed to connect to Lume API: {:?}", e);
+                error!("❌ Failed to initialize Meda client: {:?}", e);
                 error!("Agent will continue but VM operations will likely fail");
             }
-        },
-        Err(e) => {
-            error!("❌ Failed to initialize Lume client: {:?}", e);
-            error!("Agent will continue but VM operations will likely fail");
+        }
+    } else {
+        info!("Detected macOS platform - using Lume for VM management");
+        lume::download_and_run_lume().await;
+        log_dir = PathBuf::from(&home_dir).join(".lume/logs");
+
+        info!("Checking Lume connectivity...");
+        match LumeClient::new() {
+            Ok(lume) => match lume.list_vms().await {
+                Ok(vms) => {
+                    info!("✅ Successfully connected to Lume. Found {} VMs", vms.len());
+                    for vm in vms {
+                        info!(
+                            "- {} ({}, {}, CPU: {}, Memory: {}, Disk: {})",
+                            vm.name, vm.state, vm.os, vm.cpu, vm.memory, vm.disk_size.total
+                        );
+                    }
+                }
+                Err(e) => {
+                    error!("❌ Failed to connect to Lume API: {:?}", e);
+                    error!("Agent will continue but VM operations will likely fail");
+                }
+            },
+            Err(e) => {
+                error!("❌ Failed to initialize Lume client: {:?}", e);
+                error!("Agent will continue but VM operations will likely fail");
+            }
         }
     }
 
-    // Set up log cleanup parameters
-    let home_dir = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let log_dir = PathBuf::from(&home_dir).join(".lume/logs");
     let mut last_cleanup = SystemTime::now();
     let cleanup_interval = Duration::from_secs(24 * 60 * 60); // Daily log cleanup
 
@@ -660,7 +1111,13 @@ async fn main() {
         // Check if it's time to clean up logs
         if let Ok(duration) = SystemTime::now().duration_since(last_cleanup) {
             if duration >= cleanup_interval {
-                match cleanup_log_files(&log_dir, 7, 100) {
+                let cleanup_result = if use_meda() {
+                    cleanup_meda_logs(&log_dir, 7, 100)
+                } else {
+                    cleanup_lume_logs(&log_dir, 7, 100)
+                };
+
+                match cleanup_result {
                     // Keep logs for 7 days, rotate at 100MB
                     Ok(_) => {
                         last_cleanup = SystemTime::now();
