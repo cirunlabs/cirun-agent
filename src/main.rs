@@ -173,6 +173,26 @@ fn get_hostname() -> String {
 }
 
 // Generate or retrieve a persistent agent information
+fn check_sshpass_installed() -> bool {
+    match StdCommand::new("which").arg("sshpass").output() {
+        Ok(output) => {
+            if output.status.success() {
+                info!("✅ sshpass is installed");
+                true
+            } else {
+                error!("❌ sshpass is not installed");
+                error!("VM provisioning requires sshpass for SSH authentication");
+                error!("Install it using: brew install sshpass");
+                false
+            }
+        }
+        Err(e) => {
+            warn!("Failed to check for sshpass: {}", e);
+            false
+        }
+    }
+}
+
 fn get_agent_info(id_file: &str) -> AgentInfo {
     let id = if Path::new(id_file).exists() {
         match fs::read_to_string(id_file) {
@@ -735,10 +755,26 @@ impl CirunClient {
                 );
 
                 // Create a template config from the runner specification
+                // Detect registry from image name - default to ghcr.io unless explicitly specified
+                let (registry, image) = if runner.os.contains('.')
+                    && runner.os.split('/').next().unwrap().contains('.')
+                {
+                    // Image has explicit registry prefix (e.g., ghcr.io/org/image, docker.io/library/ubuntu)
+                    let parts: Vec<&str> = runner.os.splitn(2, '/').collect();
+                    if parts.len() == 2 {
+                        (Some(parts[0].to_string()), parts[1].to_string())
+                    } else {
+                        (Some("ghcr.io".to_string()), runner.os.clone())
+                    }
+                } else {
+                    // No explicit registry - default to ghcr.io
+                    (Some("ghcr.io".to_string()), runner.os.clone())
+                };
+
                 let template_config = TemplateConfig {
-                    image: runner.os.clone(),
-                    registry: None,     // Default registry
-                    organization: None, // Default organization
+                    image,
+                    registry,
+                    organization: None, // Will be extracted from image name
                     cpu: runner.cpu,
                     memory: runner.memory,
                     disk: runner.disk,
@@ -751,7 +787,7 @@ impl CirunClient {
                         "Using meda on Linux - using image name directly: {}",
                         runner.os
                     );
-                    runner.os.clone()
+                    Some(runner.os.clone())
                 } else {
                     // For lume (macOS), try to find an existing template with matching configuration
                     if let Some(existing_template) = find_matching_template(&template_config).await
@@ -760,7 +796,7 @@ impl CirunClient {
                             "Found existing template with matching configuration: {}",
                             existing_template
                         );
-                        existing_template
+                        Some(existing_template)
                     } else {
                         // Generate a new template name
                         let generated_name = generate_template_name(&template_config);
@@ -776,87 +812,62 @@ impl CirunClient {
                             match create_template(&template_config, &generated_name).await {
                                 Ok(_) => {
                                     info!("✅ Successfully created template: {}", generated_name);
-                                    generated_name
+                                    Some(generated_name)
                                 }
                                 Err(e) => {
                                     error!(
                                         "❌ Failed to create template {}: {}",
                                         generated_name, e
                                     );
-                                    // If template creation fails, fall back to default template
-                                    info!("Falling back to default template due to template creation failure");
-                                    "cirun-runner-template".to_string()
+                                    error!(
+                                        "Skipping runner '{}' due to template creation failure",
+                                        runner.name
+                                    );
+                                    None
                                 }
                             }
                         } else {
                             info!("Using existing template: {}", generated_name);
-                            generated_name
+                            Some(generated_name)
                         }
                     }
                 };
 
-                // Provision the runner using the template
-                info!(
-                    "Provisioning runner '{}' with template '{}'",
-                    runner.name, template_name
-                );
+                // Provision the runner using the template (only if we have a valid template)
+                if let Some(template_name) = template_name {
+                    info!(
+                        "Provisioning runner '{}' with template '{}'",
+                        runner.name, template_name
+                    );
 
-                let resources = RunnerResources {
-                    cpu: runner.cpu,
-                    memory: runner.memory,
-                    disk: runner.disk,
-                };
+                    let resources = RunnerResources {
+                        cpu: runner.cpu,
+                        memory: runner.memory,
+                        disk: runner.disk,
+                    };
 
-                match self
-                    .provision_runner(
-                        &runner.name,
-                        &runner.provision_script,
-                        &template_name,
-                        &runner.login,
-                        &resources,
-                    )
-                    .await
-                {
-                    Ok(_) => {
-                        info!(
-                            "✅ Successfully provisioned runner: {} using template {}",
-                            runner.name, template_name
-                        );
-                        self.report_running_vms().await;
-                    }
-                    Err(e) => {
-                        error!(
-                            "❌ Failed to provision runner {} using template {}: {}",
-                            runner.name, template_name, e
-                        );
-
-                        // If provisioning fails with the dynamic template, try the default template as fallback
-                        if template_name != "cirun-runner-template" {
+                    match self
+                        .provision_runner(
+                            &runner.name,
+                            &runner.provision_script,
+                            &template_name,
+                            &runner.login,
+                            &resources,
+                        )
+                        .await
+                    {
+                        Ok(_) => {
                             info!(
-                                "Attempting fallback to default template for runner '{}'",
-                                runner.name
+                                "✅ Successfully provisioned runner: {} using template {}",
+                                runner.name, template_name
                             );
-                            match self
-                                .provision_runner(
-                                    &runner.name,
-                                    &runner.provision_script,
-                                    "cirun-runner-template",
-                                    &runner.login,
-                                    &resources,
-                                )
-                                .await
-                            {
-                                Ok(_) => {
-                                    info!("✅ Successfully provisioned runner: {} using default template", runner.name);
-                                    self.report_running_vms().await;
-                                }
-                                Err(fallback_err) => {
-                                    error!(
-                                        "❌ Fallback also failed for runner {}: {}",
-                                        runner.name, fallback_err
-                                    );
-                                }
-                            }
+                            self.report_running_vms().await;
+                        }
+                        Err(e) => {
+                            error!(
+                                "❌ Failed to provision runner {} using template {}: {}",
+                                runner.name, template_name, e
+                            );
                         }
                     }
                 }
@@ -984,6 +995,11 @@ WantedBy=multi-user.target
         <string>--interval</string>
         <string>{}</string>
 {}    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -1310,6 +1326,12 @@ async fn main() {
     env_logger::init();
     let version = env!("CARGO_PKG_VERSION");
     info!("Cirun Agent version: {}", version);
+
+    // Check if sshpass is installed (only required on macOS)
+    if cfg!(target_os = "macos") && !check_sshpass_installed() {
+        error!("Exiting: sshpass is required for VM provisioning on macOS");
+        std::process::exit(1);
+    }
 
     // Get or generate a persistent agent information
     // Resolve id_file path to use HOME directory if it's relative
