@@ -37,8 +37,8 @@ const CIRUN_BANNER: &str = r#"
 #[command(version, about = "Cirun Agent", long_about = None)]
 struct Args {
     /// API token for authentication
-    #[arg(short, long)]
-    api_token: String,
+    #[arg(short, long, required_unless_present = "uninstall_service")]
+    api_token: Option<String>,
 
     /// Polling interval in seconds
     #[arg(short, long, default_value_t = 5)]
@@ -55,6 +55,10 @@ struct Args {
     /// Install cirun-agent as a system service (systemd on Linux, launchd on macOS)
     #[arg(long)]
     install_service: bool,
+
+    /// Uninstall cirun-agent system service
+    #[arg(long)]
+    uninstall_service: bool,
 }
 
 // Structs for agent and API data
@@ -873,7 +877,11 @@ fn install_service(args: &Args) {
     let exe_path_str = exe_path.to_str().expect("Failed to convert path to string");
 
     // Build the command line
-    let mut cmd = format!("{} --api-token {}", exe_path_str, args.api_token);
+    let api_token = args
+        .api_token
+        .as_ref()
+        .expect("API token is required for service installation");
+    let mut cmd = format!("{} --api-token {}", exe_path_str, api_token);
     if args.interval != 5 {
         cmd.push_str(&format!(" --interval {}", args.interval));
     }
@@ -988,7 +996,7 @@ WantedBy=multi-user.target
 </plist>
 "#,
             exe_path_str,
-            args.api_token,
+            api_token,
             args.interval,
             if args.verbose {
                 "        <string>--verbose</string>\n"
@@ -1016,6 +1024,84 @@ WantedBy=multi-user.target
             "Restart service: launchctl unload {} && launchctl load {}",
             plist_path, plist_path
         );
+    } else {
+        eprintln!("Unsupported operating system");
+        std::process::exit(1);
+    }
+}
+
+fn uninstall_service() {
+    println!("Uninstalling cirun-agent system service...");
+
+    if cfg!(target_os = "linux") {
+        let service_path = "/etc/systemd/system/cirun-agent.service";
+
+        // Check if service exists
+        if !std::path::Path::new(service_path).exists() {
+            println!("[ERROR] Service is not installed");
+            std::process::exit(1);
+        }
+
+        // Stop the service
+        println!("Stopping cirun-agent service...");
+        let _ = std::process::Command::new("systemctl")
+            .args(["stop", "cirun-agent"])
+            .status();
+        println!("[OK] Stopped cirun-agent service");
+
+        // Disable the service
+        println!("Disabling cirun-agent service...");
+        let _ = std::process::Command::new("systemctl")
+            .args(["disable", "cirun-agent"])
+            .status();
+        println!("[OK] Disabled cirun-agent service");
+
+        // Remove the service file
+        if let Err(e) = std::fs::remove_file(service_path) {
+            eprintln!("[ERROR] Failed to remove service file: {}", e);
+            std::process::exit(1);
+        }
+        println!("[OK] Removed service file: {}", service_path);
+
+        // Reload systemd
+        std::process::Command::new("systemctl")
+            .args(["daemon-reload"])
+            .status()
+            .expect("Failed to reload systemd");
+        println!("[OK] Reloaded systemd");
+
+        println!("\n[OK] Service uninstalled successfully!");
+    } else if cfg!(target_os = "macos") {
+        let home_dir = std::env::var("HOME").expect("Failed to get HOME directory");
+        let plist_path = format!("{}/Library/LaunchAgents/io.cirun.agent.plist", home_dir);
+
+        // Check if service exists
+        if !std::path::Path::new(&plist_path).exists() {
+            println!("[ERROR] Service is not installed");
+            std::process::exit(1);
+        }
+
+        // Unload the service
+        println!("Unloading cirun-agent service...");
+        match std::process::Command::new("launchctl")
+            .args(["unload", &plist_path])
+            .status()
+        {
+            Ok(_) => println!("[OK] Unloaded cirun-agent service"),
+            Err(e) => {
+                eprintln!("[ERROR] Failed to unload service: {}", e);
+                std::process::exit(1);
+            }
+        }
+
+        // Remove the plist file
+        if let Err(e) = std::fs::remove_file(&plist_path) {
+            eprintln!("[ERROR] Failed to remove plist file: {}", e);
+            std::process::exit(1);
+        }
+        println!("[OK] Removed plist file: {}", plist_path);
+
+        println!("\n[OK] Service uninstalled successfully!");
     } else {
         eprintln!("Unsupported operating system");
         std::process::exit(1);
@@ -1209,6 +1295,12 @@ async fn main() {
         return;
     }
 
+    // Handle uninstall service flag
+    if args.uninstall_service {
+        uninstall_service();
+        return;
+    }
+
     // Initialize logger with the appropriate level
     if args.verbose {
         env::set_var("RUST_LOG", "debug");
@@ -1220,7 +1312,17 @@ async fn main() {
     info!("Cirun Agent version: {}", version);
 
     // Get or generate a persistent agent information
-    let agent_info = get_agent_info(&args.id_file);
+    // Resolve id_file path to use HOME directory if it's relative
+    let id_file_path = if Path::new(&args.id_file).is_absolute() {
+        args.id_file.clone()
+    } else {
+        let home_dir = env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        PathBuf::from(&home_dir)
+            .join(&args.id_file)
+            .to_string_lossy()
+            .to_string()
+    };
+    let agent_info = get_agent_info(&id_file_path);
     info!("Agent ID: {}", agent_info.id);
     info!("Hostname: {}", agent_info.hostname);
     info!("OS: {} ({})", agent_info.os, agent_info.arch);
@@ -1228,7 +1330,11 @@ async fn main() {
     let default_api_url = "https://api.cirun.io/api/v1";
     let cirun_api_url = env::var("CIRUN_API_URL").unwrap_or_else(|_| default_api_url.to_string());
     info!("Cirun API URL: {}", cirun_api_url);
-    let client = CirunClient::new(&cirun_api_url, &args.api_token, agent_info);
+    let api_token = args
+        .api_token
+        .as_ref()
+        .expect("API token is required when not installing or uninstalling service");
+    let client = CirunClient::new(&cirun_api_url, api_token, agent_info);
 
     // Set up log cleanup parameters based on platform
     let home_dir = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());

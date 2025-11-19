@@ -94,17 +94,53 @@ jobs:
             echo "✅ Service still running after reinstall"
           fi
 
-      - name: Cleanup
-        if: always()
+      - name: Test uninstall service command
         run: |
           if [ "$RUNNER_OS" == "Linux" ]; then
-            sudo systemctl stop cirun-agent || true
-            sudo systemctl disable cirun-agent || true
-            sudo rm /etc/systemd/system/cirun-agent.service || true
+            sudo ./target/release/cirun-agent --uninstall-service
           else
-            launchctl unload "$HOME/Library/LaunchAgents/io.cirun.agent.plist" || true
-            rm "$HOME/Library/LaunchAgents/io.cirun.agent.plist" || true
+            ./target/release/cirun-agent --uninstall-service
           fi
+
+      - name: Verify service was uninstalled
+        run: |
+          if [ "$RUNNER_OS" == "Linux" ]; then
+            if [ -f /etc/systemd/system/cirun-agent.service ]; then
+              echo "[ERROR] Service file still exists"
+              exit 1
+            fi
+            if systemctl is-enabled cirun-agent 2>/dev/null; then
+              echo "[ERROR] Service is still enabled"
+              exit 1
+            fi
+            echo "[OK] Service successfully uninstalled on Linux"
+          else
+            if [ -f "$HOME/Library/LaunchAgents/io.cirun.agent.plist" ]; then
+              echo "[ERROR] Plist file still exists"
+              exit 1
+            fi
+            if launchctl list | grep io.cirun.agent 2>/dev/null; then
+              echo "[ERROR] Service is still loaded"
+              exit 1
+            fi
+            echo "[OK] Service successfully uninstalled on macOS"
+          fi
+
+      - name: Test uninstall when service not installed
+        run: |
+          # This should fail with exit code 1
+          if [ "$RUNNER_OS" == "Linux" ]; then
+            if sudo ./target/release/cirun-agent --uninstall-service; then
+              echo "[ERROR] Uninstall should have failed when service not installed"
+              exit 1
+            fi
+          else
+            if ./target/release/cirun-agent --uninstall-service; then
+              echo "[ERROR] Uninstall should have failed when service not installed"
+              exit 1
+            fi
+          fi
+          echo "[OK] Uninstall correctly failed when service not installed"
 
       - name: Test help command
         run: ./target/release/cirun-agent --help
