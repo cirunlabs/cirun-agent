@@ -60,7 +60,13 @@ struct Args {
     /// Uninstall cirun-agent system service
     #[arg(long)]
     uninstall_service: bool,
+
+    /// Maximum number of concurrent VMs (required on macOS due to Apple Virtualization Framework limit of 2)
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    max_vms: Option<u32>,
 }
+
+const MACOS_DEFAULT_MAX_VMS: u32 = 2;
 
 // Structs for agent and API data
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -140,21 +146,31 @@ fn use_meda() -> bool {
     env::consts::OS == "linux"
 }
 
-/// Check if there is VM capacity available on macOS
-/// Returns Ok(true) if capacity is available (< 2 VMs running)
-/// Returns Ok(false) if at capacity (2+ VMs running due to Apple Virtualization Framework limit)
-async fn has_vm_capacity(lume: &LumeClient) -> Result<bool, Box<dyn std::error::Error>> {
-    let vms = lume.list_vms().await?;
-    let running_count = vms.iter().filter(|vm| vm.state == "running").count();
+/// Check if there is VM capacity available
+/// Returns Ok(true) if capacity is available (running VMs < max_vms)
+/// Returns Ok(false) if at capacity
+async fn check_vm_capacity(max_vms: u32) -> Result<bool, Box<dyn std::error::Error>> {
+    let running_count = if use_meda() {
+        let meda = MedaClient::new()?;
+        let vms = meda.list_vms().await?;
+        vms.iter().filter(|vm| vm.state == "running").count()
+    } else {
+        let lume = LumeClient::new()?;
+        let vms = lume.list_vms().await?;
+        vms.iter().filter(|vm| vm.state == "running").count()
+    };
 
-    if running_count >= 2 {
+    if running_count >= max_vms as usize {
         info!(
-            "macOS VM capacity limit reached ({} running VMs). Apple Virtualization Framework limits to 2 concurrent VMs.",
-            running_count
+            "VM capacity limit reached ({}/{} running VMs)",
+            running_count, max_vms
         );
         Ok(false)
     } else {
-        debug!("VM capacity available ({}/2 VMs running)", running_count);
+        debug!(
+            "VM capacity available ({}/{} VMs running)",
+            running_count, max_vms
+        );
         Ok(true)
     }
 }
@@ -245,16 +261,19 @@ struct CirunClient {
     api_token: String,
     agent: AgentInfo,
     retry_tracker: HashMap<String, u32>,
+    /// None means no limit, Some(n) means max n concurrent VMs
+    max_vms: Option<u32>,
 }
 
 impl CirunClient {
-    fn new(base_url: &str, api_token: &str, agent: AgentInfo) -> Self {
+    fn new(base_url: &str, api_token: &str, agent: AgentInfo, max_vms: Option<u32>) -> Self {
         CirunClient {
             client: Client::new(),
             base_url: base_url.to_string(),
             api_token: api_token.to_string(),
             agent,
             retry_tracker: HashMap::new(),
+            max_vms,
         }
     }
 
@@ -872,33 +891,26 @@ impl CirunClient {
                 json.runners_to_provision.len()
             );
 
-            // Check macOS VM capacity before starting provisioning loop
-            if !use_meda() {
-                match LumeClient::new() {
-                    Ok(lume) => {
-                        match has_vm_capacity(&lume).await {
-                            Ok(false) => {
-                                info!("macOS VM capacity limit reached. Skipping all provisioning attempts.");
-                                return Ok(json);
-                            }
-                            Err(e) => {
-                                warn!("Failed to check VM capacity: {}. Continuing with provisioning...", e);
-                            }
-                            Ok(true) => {
-                                debug!("VM capacity available");
-                            }
+            for runner in &json.runners_to_provision {
+                // Check VM capacity before each provisioning attempt
+                if let Some(max_vms) = self.max_vms {
+                    match check_vm_capacity(max_vms).await {
+                        Ok(false) => {
+                            info!(
+                                "VM capacity limit reached ({} max). Skipping remaining provisioning.",
+                                max_vms
+                            );
+                            break;
                         }
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to initialize Lume client for capacity check: {:?}",
-                            e
-                        );
+                        Err(e) => {
+                            warn!(
+                                "Failed to check VM capacity: {}. Continuing with provisioning...",
+                                e
+                            );
+                        }
+                        Ok(true) => {}
                     }
                 }
-            }
-
-            for runner in &json.runners_to_provision {
                 // Check retry count before attempting provisioning
                 let max_retries = runner.max_retries;
                 let current_attempts = self.get_retry_count(&runner.name);
@@ -1536,11 +1548,28 @@ async fn main() {
     let default_api_url = "https://api.cirun.io/api/v1";
     let cirun_api_url = env::var("CIRUN_API_URL").unwrap_or_else(|_| default_api_url.to_string());
     info!("Cirun API URL: {}", cirun_api_url);
+
+    // Determine effective max_vms:
+    // - If explicitly provided, use that value
+    // - On macOS: default to 2 (Apple Virtualization Framework limit)
+    // - On Linux: no limit (None)
+    let max_vms = args.max_vms.or_else(|| {
+        if use_meda() {
+            None // No default limit on Linux
+        } else {
+            Some(MACOS_DEFAULT_MAX_VMS)
+        }
+    });
+    match max_vms {
+        Some(limit) => info!("Max concurrent VMs: {}", limit),
+        None => info!("Max concurrent VMs: unlimited"),
+    }
+
     let api_token = args
         .api_token
         .as_ref()
         .expect("API token is required when not installing or uninstalling service");
-    let mut client = CirunClient::new(&cirun_api_url, api_token, agent_info);
+    let mut client = CirunClient::new(&cirun_api_url, api_token, agent_info, max_vms);
 
     // Set up log cleanup parameters based on platform
     let home_dir = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());

@@ -87,6 +87,7 @@ For more details, checkout docs: https://docs.cirun.io/on-prem
 | `--id-file` | `-f` | Agent ID file path | .agent_id |
 | `--verbose` | `-v` | Enable verbose logging | false |
 | `--install-service` | | Install as system service | false |
+| `--max-vms` | | Maximum concurrent VMs (min: 1) | 2 (macOS), unlimited (Linux) |
 
 ### Environment Variables
 
@@ -118,6 +119,20 @@ cirun-agent --api-token YOUR_API_TOKEN --interval 30
 1. Create a VM named `cirun-runner-template` using Lume (macOS) or Meda (Linux)
 2. Configure it with your required tools and settings
 3. Start the agent - it will clone this template when provisioning new runners
+
+### Limiting Concurrent VMs
+
+Control the maximum number of VMs running simultaneously:
+
+```bash
+# Limit to 5 concurrent VMs (useful for resource management)
+cirun-agent --api-token YOUR_API_TOKEN --max-vms 5
+
+# macOS automatically defaults to 2 VMs (Apple Virtualization Framework limit)
+# Linux has no default limit unless specified
+```
+
+**Note**: On macOS, the Apple Virtualization Framework limits concurrent VMs to 2, so the agent defaults to `--max-vms 2` automatically.
 
 ## 🏗️ Architecture
 
