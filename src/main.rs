@@ -15,6 +15,7 @@ use log::{debug, error, info, warn};
 use reqwest::{Client, Error};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -101,16 +102,23 @@ struct RunnerResources {
     disk: u32,
 }
 
+fn default_max_retries() -> u32 {
+    3
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct RunnerToProvision {
     name: String,
     provision_script: String,
-    os: String, // This is actually the image to use
+    image: String, // The container/VM image to use
+    os: String,    // The OS platform: "linux", "macos", or "windows"
     cpu: u32,
     memory: u32,
     #[serde(default)]
     disk: u32,
     login: RunnerLogin,
+    #[serde(default = "default_max_retries")]
+    max_retries: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -132,29 +140,23 @@ fn use_meda() -> bool {
     env::consts::OS == "linux"
 }
 
-// Helper function to determine OS from image name
-fn get_os_from_image(image: &str) -> String {
-    let image_lower = image.to_lowercase();
+/// Check if there is VM capacity available on macOS
+/// Returns Ok(true) if capacity is available (< 2 VMs running)
+/// Returns Ok(false) if at capacity (2+ VMs running due to Apple Virtualization Framework limit)
+async fn has_vm_capacity(lume: &LumeClient) -> Result<bool, Box<dyn std::error::Error>> {
+    let vms = lume.list_vms().await?;
+    let running_count = vms.iter().filter(|vm| vm.state == "running").count();
 
-    if image_lower.contains("macos")
-        || image_lower.contains("mac-os")
-        || image_lower.contains("sonoma")
-        || image_lower.contains("ventura")
-        || image_lower.contains("monterey")
-    {
-        return "macOS".to_string();
-    } else if image_lower.contains("ubuntu")
-        || image_lower.contains("debian")
-        || image_lower.contains("mint")
-        || image_lower.contains("linux")
-    {
-        return "linux".to_string();
-    } else if image_lower.contains("windows") {
-        return "windows".to_string();
+    if running_count >= 2 {
+        info!(
+            "macOS VM capacity limit reached ({} running VMs). Apple Virtualization Framework limits to 2 concurrent VMs.",
+            running_count
+        );
+        Ok(false)
+    } else {
+        debug!("VM capacity available ({}/2 VMs running)", running_count);
+        Ok(true)
     }
-
-    // Default to linux if we can't determine
-    "linux".to_string()
 }
 
 // Get system hostname
@@ -242,6 +244,7 @@ struct CirunClient {
     base_url: String,
     api_token: String,
     agent: AgentInfo,
+    retry_tracker: HashMap<String, u32>,
 }
 
 impl CirunClient {
@@ -251,6 +254,7 @@ impl CirunClient {
             base_url: base_url.to_string(),
             api_token: api_token.to_string(),
             agent,
+            retry_tracker: HashMap::new(),
         }
     }
 
@@ -305,15 +309,18 @@ impl CirunClient {
                 Ok(meda) => {
                     match meda.list_vms().await {
                         Ok(vms) => {
-                            let running_vms: Vec<_> =
-                                vms.into_iter().filter(|vm| vm.state == "running").collect();
+                            // Report all cirun VMs (running or stopped) so API can sync deletion state
+                            let cirun_vms: Vec<_> = vms
+                                .into_iter()
+                                .filter(|vm| vm.name.starts_with("cirun-"))
+                                .collect();
                             let url = format!("{}/agent", self.base_url);
 
                             let res = self
                                 .create_request(reqwest::Method::POST, &url)
                                 .json(&json!({
                                     "agent": self.agent,
-                                    "running_vms": running_vms.iter().map(|vm| {
+                                    "vms": cirun_vms.iter().map(|vm| {
                                         json!({
                                             "name": vm.name,
                                             "os": "linux",
@@ -351,8 +358,11 @@ impl CirunClient {
                 Ok(lume) => {
                     match lume.list_vms().await {
                         Ok(vms) => {
-                            let running_vms: Vec<_> =
-                                vms.into_iter().filter(|vm| vm.state == "running").collect();
+                            // Report all cirun VMs (running or stopped) so API can sync deletion state
+                            let cirun_vms: Vec<_> = vms
+                                .into_iter()
+                                .filter(|vm| vm.name.starts_with("cirun-"))
+                                .collect();
                             let url = format!("{}/agent", self.base_url);
 
                             // Use the helper method instead of direct client access
@@ -360,7 +370,7 @@ impl CirunClient {
                                 .create_request(reqwest::Method::POST, &url)
                                 .json(&json!({
                                     "agent": self.agent,
-                                    "running_vms": running_vms.iter().map(|vm| {
+                                    "vms": cirun_vms.iter().map(|vm| {
                                         json!({
                                             "name": vm.name,
                                             "os": vm.os,
@@ -391,6 +401,47 @@ impl CirunClient {
                     }
                 }
                 Err(e) => error!("Failed to initialize Lume client: {:?}", e),
+            }
+        }
+    }
+
+    /// Helper function to cleanup a failed runner VM
+    async fn cleanup_failed_runner(runner_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+        info!("Cleaning up failed runner: {}", runner_name);
+
+        if use_meda() {
+            match MedaClient::new() {
+                Ok(meda) => match meda.delete_vm(runner_name).await {
+                    Ok(_) => {
+                        info!("Successfully deleted failed runner VM: {}", runner_name);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        error!("Failed to delete runner VM {}: {:?}", runner_name, e);
+                        Err(e.into())
+                    }
+                },
+                Err(e) => {
+                    error!("Failed to initialize Meda client for cleanup: {:?}", e);
+                    Err(e.into())
+                }
+            }
+        } else {
+            match LumeClient::new() {
+                Ok(lume) => match lume.delete_vm(runner_name).await {
+                    Ok(_) => {
+                        info!("Successfully deleted failed runner VM: {}", runner_name);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        error!("Failed to delete runner VM {}: {:?}", runner_name, e);
+                        Err(e.into())
+                    }
+                },
+                Err(e) => {
+                    error!("Failed to initialize Lume client for cleanup: {:?}", e);
+                    Err(e.into())
+                }
             }
         }
     }
@@ -456,11 +507,13 @@ impl CirunClient {
                                         "Failed to clone VM from template '{}': {:?}",
                                         template_name, e
                                     );
-                                    return Err(format!(
+                                    let err_msg = format!(
                                         "Failed to clone VM from template '{}': {:?}",
                                         template_name, e
-                                    )
-                                    .into());
+                                    );
+                                    // Attempt cleanup, but don't fail if cleanup fails
+                                    let _ = Self::cleanup_failed_runner(runner_name).await;
+                                    return Err(err_msg.into());
                                 }
                             }
                         }
@@ -512,6 +565,8 @@ impl CirunClient {
                     }
                     Err(e) => {
                         error!("Failed to provision runner: {}", e);
+                        // Cleanup the failed runner VM
+                        let _ = Self::cleanup_failed_runner(runner_name).await;
                         Err(e)
                     }
                 }
@@ -574,11 +629,13 @@ impl CirunClient {
                             }
                             Err(e) => {
                                 error!("Failed to create and run VM '{}': {:?}", runner_name, e);
-                                return Err(format!(
+                                let err_msg = format!(
                                     "Failed to create and run VM from image '{}': {:?}",
                                     image, e
-                                )
-                                .into());
+                                );
+                                // Attempt cleanup
+                                let _ = Self::cleanup_failed_runner(runner_name).await;
+                                return Err(err_msg.into());
                             }
                         }
                     }
@@ -590,6 +647,8 @@ impl CirunClient {
                     Ok(ip) => ip,
                     Err(e) => {
                         error!("Failed to get VM IP address: {:?}", e);
+                        // Cleanup the failed runner VM
+                        let _ = Self::cleanup_failed_runner(runner_name).await;
                         return Err(e.into());
                     }
                 };
@@ -618,6 +677,8 @@ impl CirunClient {
                     }
                     Err(e) => {
                         error!("Failed to provision runner: {}", e);
+                        // Cleanup the failed runner VM
+                        let _ = Self::cleanup_failed_runner(runner_name).await;
                         Err(e)
                     }
                 }
@@ -702,7 +763,72 @@ impl CirunClient {
         }
     }
 
-    async fn manage_runner_lifecycle(&self) -> Result<ApiResponse, Error> {
+    /// Get the current retry count for a runner
+    fn get_retry_count(&self, runner_name: &str) -> u32 {
+        *self.retry_tracker.get(runner_name).unwrap_or(&0)
+    }
+
+    /// Increment the retry count for a runner and return the new count
+    fn increment_retry(&mut self, runner_name: &str) -> u32 {
+        let count = self
+            .retry_tracker
+            .entry(runner_name.to_string())
+            .or_insert(0);
+        *count += 1;
+        *count
+    }
+
+    /// Clear the retry count for a runner
+    fn clear_retry(&mut self, runner_name: &str) {
+        self.retry_tracker.remove(runner_name);
+    }
+
+    /// Check if a runner should be retried based on max_retries
+    fn should_retry(&self, runner_name: &str, max_retries: u32) -> bool {
+        self.get_retry_count(runner_name) < max_retries
+    }
+
+    /// Notify the API that a runner provisioning attempt failed
+    async fn notify_provision_failure(&self, runner_name: &str, error: String, attempt: u32) {
+        let url = format!("{}/agent", self.base_url);
+
+        info!(
+            "Notifying API of provisioning failure for {} (attempt {})",
+            runner_name, attempt
+        );
+
+        let request_data = json!({
+            "agent": self.agent,
+            "provision_failure": {
+                "runner_name": runner_name,
+                "error": error,
+                "attempt": attempt,
+            }
+        });
+
+        match self
+            .create_request(reqwest::Method::POST, &url)
+            .json(&request_data)
+            .send()
+            .await
+        {
+            Ok(response) => {
+                if response.status().is_success() {
+                    debug!("Successfully notified API of provisioning failure");
+                } else {
+                    warn!(
+                        "API returned non-success status for failure notification: {}",
+                        response.status()
+                    );
+                }
+            }
+            Err(e) => {
+                warn!("Failed to notify API of provisioning failure: {}", e);
+            }
+        }
+    }
+
+    async fn manage_runner_lifecycle(&mut self) -> Result<ApiResponse, Error> {
         let url = format!("{}/agent", self.base_url);
         info!("Fetching runner provision/deletion data from: {}", url);
 
@@ -746,9 +872,60 @@ impl CirunClient {
                 json.runners_to_provision.len()
             );
 
+            // Check macOS VM capacity before starting provisioning loop
+            if !use_meda() {
+                match LumeClient::new() {
+                    Ok(lume) => {
+                        match has_vm_capacity(&lume).await {
+                            Ok(false) => {
+                                info!("macOS VM capacity limit reached. Skipping all provisioning attempts.");
+                                return Ok(json);
+                            }
+                            Err(e) => {
+                                warn!("Failed to check VM capacity: {}. Continuing with provisioning...", e);
+                            }
+                            Ok(true) => {
+                                debug!("VM capacity available");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to initialize Lume client for capacity check: {:?}",
+                            e
+                        );
+                    }
+                }
+            }
+
             for runner in &json.runners_to_provision {
-                info!("Processing runner: {}", runner.name);
-                info!("  - Image/OS: {}", runner.os);
+                // Check retry count before attempting provisioning
+                let max_retries = runner.max_retries;
+                let current_attempts = self.get_retry_count(&runner.name);
+
+                if !self.should_retry(&runner.name, max_retries) {
+                    warn!(
+                        "Runner '{}' has exceeded max retries ({}/{}). Skipping provisioning.",
+                        runner.name, current_attempts, max_retries
+                    );
+                    // Notify API about final failure
+                    self.notify_provision_failure(
+                        &runner.name,
+                        format!("Exceeded max retries ({})", max_retries),
+                        current_attempts,
+                    )
+                    .await;
+                    continue;
+                }
+
+                info!(
+                    "Processing runner: {} (attempt {}/{})",
+                    runner.name,
+                    current_attempts + 1,
+                    max_retries
+                );
+                info!("  - Image: {}", runner.image);
+                info!("  - OS: {}", runner.os);
                 info!(
                     "  - CPU: {}, Memory: {}GB, Disk: {}GB",
                     runner.cpu, runner.memory, runner.disk
@@ -756,19 +933,19 @@ impl CirunClient {
 
                 // Create a template config from the runner specification
                 // Detect registry from image name - default to ghcr.io unless explicitly specified
-                let (registry, image) = if runner.os.contains('.')
-                    && runner.os.split('/').next().unwrap().contains('.')
+                let (registry, image) = if runner.image.contains('.')
+                    && runner.image.split('/').next().unwrap().contains('.')
                 {
                     // Image has explicit registry prefix (e.g., ghcr.io/org/image, docker.io/library/ubuntu)
-                    let parts: Vec<&str> = runner.os.splitn(2, '/').collect();
+                    let parts: Vec<&str> = runner.image.splitn(2, '/').collect();
                     if parts.len() == 2 {
                         (Some(parts[0].to_string()), parts[1].to_string())
                     } else {
-                        (Some("ghcr.io".to_string()), runner.os.clone())
+                        (Some("ghcr.io".to_string()), runner.image.clone())
                     }
                 } else {
                     // No explicit registry - default to ghcr.io
-                    (Some("ghcr.io".to_string()), runner.os.clone())
+                    (Some("ghcr.io".to_string()), runner.image.clone())
                 };
 
                 let template_config = TemplateConfig {
@@ -778,16 +955,16 @@ impl CirunClient {
                     cpu: runner.cpu,
                     memory: runner.memory,
                     disk: runner.disk,
-                    os: get_os_from_image(&runner.os), // Determine OS type from image name
+                    os: runner.os.clone(),
                 };
 
                 // For meda (Linux), use the image name directly. Templates are only for lume (macOS).
                 let template_name = if use_meda() {
                     info!(
                         "Using meda on Linux - using image name directly: {}",
-                        runner.os
+                        runner.image
                     );
-                    Some(runner.os.clone())
+                    Some(runner.image.clone())
                 } else {
                     // For lume (macOS), try to find an existing template with matching configuration
                     if let Some(existing_template) = find_matching_template(&template_config).await
@@ -861,13 +1038,20 @@ impl CirunClient {
                                 "✅ Successfully provisioned runner: {} using template {}",
                                 runner.name, template_name
                             );
+                            // Clear retry count on success
+                            self.clear_retry(&runner.name);
                             self.report_running_vms().await;
                         }
                         Err(e) => {
+                            let error_msg = format!("{}", e);
                             error!(
                                 "❌ Failed to provision runner {} using template {}: {}",
-                                runner.name, template_name, e
+                                runner.name, template_name, error_msg
                             );
+                            // Increment retry count and notify API
+                            let attempt = self.increment_retry(&runner.name);
+                            self.notify_provision_failure(&runner.name, error_msg, attempt)
+                                .await;
                         }
                     }
                 }
@@ -1356,7 +1540,7 @@ async fn main() {
         .api_token
         .as_ref()
         .expect("API token is required when not installing or uninstalling service");
-    let client = CirunClient::new(&cirun_api_url, api_token, agent_info);
+    let mut client = CirunClient::new(&cirun_api_url, api_token, agent_info);
 
     // Set up log cleanup parameters based on platform
     let home_dir = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
@@ -1467,35 +1651,6 @@ mod tests {
     use super::*;
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
-
-    #[test]
-    fn test_get_os_from_image() {
-        // macOS variants
-        assert_eq!(get_os_from_image("macos-sonoma"), "macOS");
-        assert_eq!(get_os_from_image("macos-ventura"), "macOS");
-        assert_eq!(get_os_from_image("macos-monterey"), "macOS");
-        assert_eq!(get_os_from_image("mac-os-something"), "macOS");
-        assert_eq!(
-            get_os_from_image("cirunlabs/macos-sequoia-xcode:15.3.1"),
-            "macOS"
-        );
-
-        // Linux variants
-        assert_eq!(get_os_from_image("ubuntu-20.04"), "linux");
-        assert_eq!(get_os_from_image("debian-11"), "linux");
-        assert_eq!(get_os_from_image("mint-21"), "linux");
-        assert_eq!(get_os_from_image("linux-server"), "linux");
-        assert_eq!(get_os_from_image("cirunlabs/ubuntu:22.04"), "linux");
-
-        // Windows variants
-        assert_eq!(get_os_from_image("windows-11"), "windows");
-        assert_eq!(get_os_from_image("windows-server-2022"), "windows");
-        assert_eq!(get_os_from_image("cirunlabs/windows:10"), "windows");
-
-        // Unknown should default to linux
-        assert_eq!(get_os_from_image("unknown-os"), "linux");
-        assert_eq!(get_os_from_image("cirunlabs/unknown:latest"), "linux");
-    }
 
     #[test]
     fn test_template_name_generation() {
