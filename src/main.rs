@@ -324,6 +324,12 @@ impl CirunClient {
 
         if use_meda() {
             // Use meda for Linux
+            // Check if meda is running, restart if needed
+            if !meda::setup::is_meda_running() {
+                warn!("Meda process is not running. Restarting...");
+                meda::download_and_run_meda().await;
+            }
+
             match MedaClient::new() {
                 Ok(meda) => {
                     match meda.list_vms().await {

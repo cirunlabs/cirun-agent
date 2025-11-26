@@ -7,6 +7,17 @@ use std::{thread, time::Duration, time::SystemTime};
 use chrono::{DateTime, Utc};
 use std::path::Path;
 
+/// Check if meda serve process is currently running
+pub fn is_meda_running() -> bool {
+    Command::new("pgrep")
+        .arg("-f")
+        .arg("meda serve")
+        .stdout(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 pub async fn download_and_run_meda() {
     // Spawn a blocking task to handle the file operations
     let result = tokio::task::spawn_blocking(download_and_run_meda_internal).await;
@@ -231,15 +242,7 @@ fn download_and_run_meda_internal() -> Result<(), Box<dyn std::error::Error + Se
     let meda_binary = found_meda.ok_or("Meda binary not found")?;
 
     // Check if meda serve is already running
-    let is_running = Command::new("pgrep")
-        .arg("-f")
-        .arg("meda serve")
-        .stdout(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false);
-
-    if is_running {
+    if is_meda_running() {
         info!("Meda server is already running");
     } else {
         // Run "meda serve" in the background
