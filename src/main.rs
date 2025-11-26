@@ -373,6 +373,12 @@ impl CirunClient {
             }
         } else {
             // Use lume for macOS
+            // Check if lume is running, restart if needed
+            if !lume::setup::is_lume_running() {
+                warn!("Lume process is not running. Restarting...");
+                lume::download_and_run_lume().await;
+            }
+
             match LumeClient::new() {
                 Ok(lume) => {
                     match lume.list_vms().await {

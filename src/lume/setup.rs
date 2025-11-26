@@ -7,6 +7,17 @@ use std::{thread, time::Duration, time::SystemTime};
 use chrono::{DateTime, Utc};
 use std::path::Path;
 
+/// Check if lume serve process is currently running
+pub fn is_lume_running() -> bool {
+    Command::new("pgrep")
+        .arg("-f")
+        .arg("lume serve")
+        .stdout(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 pub async fn download_and_run_lume() {
     // Spawn a blocking task to handle the file operations
     let result = tokio::task::spawn_blocking(download_and_run_lume_internal).await;
@@ -205,15 +216,7 @@ fn download_and_run_lume_internal() -> Result<(), Box<dyn std::error::Error + Se
     }
 
     // Check if lume is already running
-    let is_running = Command::new("pgrep")
-        .arg("-f")
-        .arg("lume serve")
-        .stdout(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false);
-
-    if is_running {
+    if is_lume_running() {
         info!("Lume is already running");
     } else {
         // Run "lume serve" in the background
