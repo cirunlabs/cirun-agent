@@ -267,8 +267,14 @@ struct CirunClient {
 
 impl CirunClient {
     fn new(base_url: &str, api_token: &str, agent: AgentInfo, max_vms: Option<u32>) -> Self {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(15))
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .expect("Failed to build HTTP client");
+
         CirunClient {
-            client: Client::new(),
+            client,
             base_url: base_url.to_string(),
             api_token: api_token.to_string(),
             agent,
