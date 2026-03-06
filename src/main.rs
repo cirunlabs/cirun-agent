@@ -211,39 +211,37 @@ async fn provision_single_runner(
             runner.image
         );
         Some(runner.image.clone())
+    } else if let Some(existing_template) = find_matching_template(&template_config).await {
+        info!(
+            "Found existing template with matching configuration: {}",
+            existing_template
+        );
+        Some(existing_template)
     } else {
-        if let Some(existing_template) = find_matching_template(&template_config).await {
-            info!(
-                "Found existing template with matching configuration: {}",
-                existing_template
-            );
-            Some(existing_template)
-        } else {
-            let generated_name = generate_template_name(&template_config);
-            let template_exists = check_template_exists(&generated_name).await;
+        let generated_name = generate_template_name(&template_config);
+        let template_exists = check_template_exists(&generated_name).await;
 
-            if !template_exists {
-                info!(
-                    "No matching template found. Creating new template '{}' from image '{}'",
-                    generated_name, template_config.image
-                );
-                match create_template(&template_config, &generated_name).await {
-                    Ok(_) => {
-                        info!("Successfully created template: {}", generated_name);
-                        Some(generated_name)
-                    }
-                    Err(e) => {
-                        error!("Failed to create template {}: {}", generated_name, e);
-                        return ProvisionResult {
-                            runner_name: runner.name.clone(),
-                            outcome: Err(format!("Template creation failed: {}", e)),
-                        };
-                    }
+        if !template_exists {
+            info!(
+                "No matching template found. Creating new template '{}' from image '{}'",
+                generated_name, template_config.image
+            );
+            match create_template(&template_config, &generated_name).await {
+                Ok(_) => {
+                    info!("Successfully created template: {}", generated_name);
+                    Some(generated_name)
                 }
-            } else {
-                info!("Using existing template: {}", generated_name);
-                Some(generated_name)
+                Err(e) => {
+                    error!("Failed to create template {}: {}", generated_name, e);
+                    return ProvisionResult {
+                        runner_name: runner.name.clone(),
+                        outcome: Err(format!("Template creation failed: {}", e)),
+                    };
+                }
             }
+        } else {
+            info!("Using existing template: {}", generated_name);
+            Some(generated_name)
         }
     };
 
@@ -300,7 +298,7 @@ async fn provision_single_runner(
             }
         }
         Err(e) => {
-            let error_msg = format!("{}", e);
+            let error_msg = e.to_string();
             error!(
                 "Failed to provision runner {} using template {}: {}",
                 runner.name, template_name, error_msg
@@ -436,9 +434,7 @@ async fn do_provision_lume(
                 template_name, e
             )
         });
-        if let Err(err_msg) = template_check {
-            return Err(err_msg);
-        }
+        template_check?;
 
         let clone_result = lume
             .clone_vm(template_name, runner_name)
