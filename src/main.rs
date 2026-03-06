@@ -20,7 +20,10 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
+use std::sync::Arc;
 use std::time::SystemTime;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
@@ -112,7 +115,7 @@ fn default_max_retries() -> u32 {
     3
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct RunnerToProvision {
     name: String,
     provision_script: String,
@@ -146,32 +149,340 @@ fn use_meda() -> bool {
     env::consts::OS == "linux"
 }
 
-/// Check if there is VM capacity available
-/// Returns Ok(true) if capacity is available (running VMs < max_vms)
-/// Returns Ok(false) if at capacity
-async fn check_vm_capacity(max_vms: u32) -> Result<bool, Box<dyn std::error::Error>> {
-    let running_count = if use_meda() {
+/// Get the count of currently running VMs
+async fn get_running_vm_count() -> Result<usize, Box<dyn std::error::Error>> {
+    if use_meda() {
         let meda = MedaClient::new()?;
         let vms = meda.list_vms().await?;
-        vms.iter().filter(|vm| vm.state == "running").count()
+        Ok(vms.iter().filter(|vm| vm.state == "running").count())
     } else {
         let lume = LumeClient::new()?;
         let vms = lume.list_vms().await?;
-        vms.iter().filter(|vm| vm.state == "running").count()
+        Ok(vms.iter().filter(|vm| vm.state == "running").count())
+    }
+}
+
+
+/// Result of a single runner provisioning attempt
+struct ProvisionResult {
+    runner_name: String,
+    outcome: Result<(), String>,
+}
+
+/// Provision a single runner in its own task (standalone, no &self needed).
+/// Acquires a semaphore permit to enforce concurrency bounds.
+async fn provision_single_runner(
+    runner: RunnerToProvision,
+    semaphore: Arc<Semaphore>,
+) -> ProvisionResult {
+    let _permit = semaphore.acquire().await.expect("semaphore closed");
+
+    info!(
+        "Processing runner: {} (image: {}, os: {}, cpu: {}, mem: {}GB, disk: {}GB)",
+        runner.name, runner.image, runner.os, runner.cpu, runner.memory, runner.disk
+    );
+
+    // Parse registry from image name
+    let (registry, image) = if runner.image.contains('.')
+        && runner.image.split('/').next().unwrap().contains('.')
+    {
+        let parts: Vec<&str> = runner.image.splitn(2, '/').collect();
+        if parts.len() == 2 {
+            (Some(parts[0].to_string()), parts[1].to_string())
+        } else {
+            (Some("ghcr.io".to_string()), runner.image.clone())
+        }
+    } else {
+        (Some("ghcr.io".to_string()), runner.image.clone())
     };
 
-    if running_count >= max_vms as usize {
+    let template_config = TemplateConfig {
+        image,
+        registry,
+        organization: None,
+        cpu: runner.cpu,
+        memory: runner.memory,
+        disk: runner.disk,
+        os: runner.os.clone(),
+    };
+
+    // Resolve template: meda uses image directly, lume uses template matching
+    let template_name = if use_meda() {
         info!(
-            "VM capacity limit reached ({}/{} running VMs)",
-            running_count, max_vms
+            "Using meda on Linux - using image name directly: {}",
+            runner.image
         );
-        Ok(false)
+        Some(runner.image.clone())
     } else {
-        debug!(
-            "VM capacity available ({}/{} VMs running)",
-            running_count, max_vms
+        if let Some(existing_template) = find_matching_template(&template_config).await {
+            info!(
+                "Found existing template with matching configuration: {}",
+                existing_template
+            );
+            Some(existing_template)
+        } else {
+            let generated_name = generate_template_name(&template_config);
+            let template_exists = check_template_exists(&generated_name).await;
+
+            if !template_exists {
+                info!(
+                    "No matching template found. Creating new template '{}' from image '{}'",
+                    generated_name, template_config.image
+                );
+                match create_template(&template_config, &generated_name).await {
+                    Ok(_) => {
+                        info!("Successfully created template: {}", generated_name);
+                        Some(generated_name)
+                    }
+                    Err(e) => {
+                        error!("Failed to create template {}: {}", generated_name, e);
+                        return ProvisionResult {
+                            runner_name: runner.name.clone(),
+                            outcome: Err(format!("Template creation failed: {}", e)),
+                        };
+                    }
+                }
+            } else {
+                info!("Using existing template: {}", generated_name);
+                Some(generated_name)
+            }
+        }
+    };
+
+    let template_name = match template_name {
+        Some(t) => t,
+        None => {
+            return ProvisionResult {
+                runner_name: runner.name.clone(),
+                outcome: Err("No template available".to_string()),
+            };
+        }
+    };
+
+    info!(
+        "Provisioning runner '{}' with template '{}'",
+        runner.name, template_name
+    );
+
+    let resources = RunnerResources {
+        cpu: runner.cpu,
+        memory: runner.memory,
+        disk: runner.disk,
+    };
+
+    // Dispatch to meda or lume provisioning
+    let result = if use_meda() {
+        do_provision_meda(
+            &runner.name,
+            &runner.provision_script,
+            &template_name,
+            &runner.login,
+            &resources,
+        )
+        .await
+    } else {
+        do_provision_lume(
+            &runner.name,
+            &runner.provision_script,
+            &template_name,
+            &runner.login,
+        )
+        .await
+    };
+
+    match result {
+        Ok(()) => {
+            info!(
+                "Successfully provisioned runner: {} using template {}",
+                runner.name, template_name
+            );
+            ProvisionResult {
+                runner_name: runner.name.clone(),
+                outcome: Ok(()),
+            }
+        }
+        Err(e) => {
+            let error_msg = format!("{}", e);
+            error!(
+                "Failed to provision runner {} using template {}: {}",
+                runner.name, template_name, error_msg
+            );
+            ProvisionResult {
+                runner_name: runner.name.clone(),
+                outcome: Err(error_msg),
+            }
+        }
+    }
+}
+
+/// Free-function version of meda provisioning (no &self needed)
+async fn do_provision_meda(
+    runner_name: &str,
+    provision_script: &str,
+    image: &str,
+    runner_login: &RunnerLogin,
+    resources: &RunnerResources,
+) -> Result<(), String> {
+    use crate::meda::models::VmRunRequest;
+
+    let meda = MedaClient::new().map_err(|e| format!("Failed to initialize Meda client: {e}"))?;
+
+    match meda.get_vm(runner_name).await {
+        Ok(vm_info) => {
+            if vm_info.state == "running" {
+                info!(
+                    "VM '{}' already exists and is running. Skipping creation.",
+                    runner_name
+                );
+            } else {
+                info!(
+                    "VM '{}' exists but is not running. Starting it...",
+                    runner_name
+                );
+                meda.start_vm(runner_name)
+                    .await
+                    .map_err(|e| format!("Failed to start VM '{}': {e}", runner_name))?;
+            }
+        }
+        Err(_) => {
+            info!(
+                "VM '{}' does not exist. Creating from image '{}'...",
+                runner_name, image
+            );
+            let run_request = VmRunRequest {
+                image: image.to_string(),
+                name: Some(runner_name.to_string()),
+                memory: Some(format!("{}G", resources.memory)),
+                cpus: Some(resources.cpu),
+                disk_size: Some(format!("{}G", resources.disk)),
+            };
+
+            if let Err(err_msg) = meda
+                .run_vm(run_request)
+                .await
+                .map_err(|e| format!("Failed to create and run VM from image '{}': {:?}", image, e))
+            {
+                error!("{}", err_msg);
+                let _ = CirunClient::cleanup_failed_runner(runner_name).await;
+                return Err(err_msg);
+            }
+            info!("VM '{}' created and started successfully", runner_name);
+        }
+    }
+
+    info!("Waiting for VM '{}' to get an IP address...", runner_name);
+    let ip_address = match meda
+        .wait_for_vm_ip(runner_name, 300)
+        .await
+        .map_err(|e| format!("Failed to get VM IP address: {:?}", e))
+    {
+        Ok(ip) => ip,
+        Err(err_msg) => {
+            error!("{}", err_msg);
+            let _ = CirunClient::cleanup_failed_runner(runner_name).await;
+            return Err(err_msg);
+        }
+    };
+
+    info!("VM '{}' has IP address: {}", runner_name, ip_address);
+    info!("Provisioning runner: {}", runner_name);
+
+    match run_script_on_vm_meda(&meda, runner_name, &ip_address, provision_script, runner_login, true)
+        .await
+        .map_err(|e| format!("Failed to provision runner: {}", e))
+    {
+        Ok(output) => {
+            info!("Runner provisioning completed successfully");
+            info!("Script output: {}", output);
+            Ok(())
+        }
+        Err(err_msg) => {
+            error!("{}", err_msg);
+            let _ = CirunClient::cleanup_failed_runner(runner_name).await;
+            Err(err_msg)
+        }
+    }
+}
+
+/// Free-function version of lume provisioning (no &self needed)
+async fn do_provision_lume(
+    runner_name: &str,
+    provision_script: &str,
+    template_name: &str,
+    runner_login: &RunnerLogin,
+) -> Result<(), String> {
+    let lume = LumeClient::new().map_err(|e| format!("Failed to initialize Lume client: {e}"))?;
+
+    let vm_result = lume.get_vm(runner_name).await;
+    let vm_exists = vm_result.is_ok();
+
+    let vm = if vm_exists {
+        vm_result.unwrap()
+    } else {
+        info!(
+            "VM '{}' does not exist. Attempting to clone from template '{}'...",
+            runner_name, template_name
         );
-        Ok(true)
+
+        let template_check = lume
+            .get_vm(template_name)
+            .await
+            .map_err(|e| format!("Template '{}' not found: {:?}. Cannot provision runner.", template_name, e));
+        if let Err(err_msg) = template_check {
+            return Err(err_msg);
+        }
+
+        let clone_result = lume
+            .clone_vm(template_name, runner_name)
+            .await
+            .map_err(|e| format!("Failed to clone VM from template '{}': {:?}", template_name, e));
+        match clone_result {
+            Ok(_) => {
+                info!(
+                    "VM '{}' cloned successfully from template '{}'",
+                    runner_name, template_name
+                );
+                lume.get_vm(runner_name).await.map_err(|e| {
+                    format!("Failed to get VM after clone: {:?}", e)
+                })?
+            }
+            Err(err_msg) => {
+                error!("{}", err_msg);
+                let _ = CirunClient::cleanup_failed_runner(runner_name).await;
+                return Err(err_msg);
+            }
+        }
+    };
+
+    info!("VM '{}' is now available", runner_name);
+
+    if vm.state != "stopped" {
+        info!(
+            "VM '{}' exists and is not stopped. Skipping provisioning.",
+            runner_name
+        );
+        return Ok(());
+    }
+
+    let username = runner_login.username.clone();
+    let password = runner_login.password.clone();
+
+    info!("Provisioning runner: {}", runner_name);
+
+    match run_script_on_vm(&lume, runner_name, provision_script, &username, &password, 20, true)
+        .await
+        .map_err(|e| format!("Failed to provision runner: {}", e))
+    {
+        Ok(output) => {
+            info!("Runner provisioning completed successfully");
+            info!("Script output: {}", output);
+            Ok(())
+        }
+        Err(err_msg) => {
+            error!("{}", err_msg);
+            let _ = CirunClient::cleanup_failed_runner(runner_name).await;
+            Err(err_msg)
+        }
     }
 }
 
@@ -483,249 +794,6 @@ impl CirunClient {
         }
     }
 
-    async fn provision_runner(
-        &self,
-        runner_name: &str,
-        provision_script: &str,
-        template_name: &str,
-        runner_login: &RunnerLogin,
-        resources: &RunnerResources,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        if use_meda() {
-            self.provision_runner_meda(
-                runner_name,
-                provision_script,
-                template_name,
-                runner_login,
-                resources,
-            )
-            .await
-        } else {
-            self.provision_runner_lume(runner_name, provision_script, template_name, runner_login)
-                .await
-        }
-    }
-
-    async fn provision_runner_lume(
-        &self,
-        runner_name: &str,
-        provision_script: &str,
-        template_name: &str,
-        runner_login: &RunnerLogin,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        match LumeClient::new() {
-            Ok(lume) => {
-                // Check if VM exists by trying to get its details
-                let vm_result = lume.get_vm(runner_name).await;
-                let vm_exists = vm_result.is_ok();
-
-                let vm = if vm_exists {
-                    vm_result.unwrap() // VM exists, unwrap safely
-                } else {
-                    info!(
-                        "VM '{}' does not exist. Attempting to clone from template '{}'...",
-                        runner_name, template_name
-                    );
-
-                    // Check if template exists
-                    match lume.get_vm(template_name).await {
-                        Ok(_) => {
-                            // Template exists, clone it
-                            match lume.clone_vm(template_name, runner_name).await {
-                                Ok(_) => {
-                                    info!(
-                                        "VM '{}' cloned successfully from template '{}'",
-                                        runner_name, template_name
-                                    );
-                                    lume.get_vm(runner_name).await? // Get VM details after cloning
-                                }
-                                Err(e) => {
-                                    error!(
-                                        "Failed to clone VM from template '{}': {:?}",
-                                        template_name, e
-                                    );
-                                    let err_msg = format!(
-                                        "Failed to clone VM from template '{}': {:?}",
-                                        template_name, e
-                                    );
-                                    // Attempt cleanup, but don't fail if cleanup fails
-                                    let _ = Self::cleanup_failed_runner(runner_name).await;
-                                    return Err(err_msg.into());
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            // Template doesn't exist
-                            error!("Template '{}' not found: {:?}", template_name, e);
-                            return Err(format!(
-                                "Template '{}' not found. Cannot provision runner.",
-                                template_name
-                            )
-                            .into());
-                        }
-                    }
-                };
-
-                info!("VM '{}' is now available", runner_name);
-
-                // If VM exists but is not stopped, skip provisioning
-                if vm.state != "stopped" {
-                    info!(
-                        "VM '{}' exists and is not stopped. Skipping provisioning.",
-                        runner_name
-                    );
-                    return Ok(());
-                }
-
-                // Read SSH credentials from environment variables or use defaults
-                let username = runner_login.username.clone();
-                let password = runner_login.password.clone();
-
-                info!("Provisioning runner: {}", runner_name);
-                info!("Running provision script on VM");
-
-                match run_script_on_vm(
-                    &lume,
-                    runner_name,
-                    provision_script,
-                    &username,
-                    &password,
-                    20,
-                    true,
-                )
-                .await
-                {
-                    Ok(output) => {
-                        info!("Runner provisioning completed successfully");
-                        info!("Script output: {}", output);
-                        Ok(())
-                    }
-                    Err(e) => {
-                        error!("Failed to provision runner: {}", e);
-                        // Cleanup the failed runner VM
-                        let _ = Self::cleanup_failed_runner(runner_name).await;
-                        Err(e)
-                    }
-                }
-            }
-            Err(e) => {
-                error!("Failed to initialize Lume client: {:?}", e);
-                Err(e.into())
-            }
-        }
-    }
-
-    async fn provision_runner_meda(
-        &self,
-        runner_name: &str,
-        provision_script: &str,
-        image: &str,
-        runner_login: &RunnerLogin,
-        resources: &RunnerResources,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        use crate::meda::models::VmRunRequest;
-
-        match MedaClient::new() {
-            Ok(meda) => {
-                // Check if VM already exists
-                match meda.get_vm(runner_name).await {
-                    Ok(vm_info) => {
-                        if vm_info.state == "running" {
-                            info!(
-                                "VM '{}' already exists and is running. Skipping creation.",
-                                runner_name
-                            );
-                            // Still try to run provisioning script
-                        } else {
-                            info!(
-                                "VM '{}' exists but is not running. Starting it...",
-                                runner_name
-                            );
-                            meda.start_vm(runner_name).await?;
-                        }
-                    }
-                    Err(_) => {
-                        // VM doesn't exist, create and run it from image
-                        info!(
-                            "VM '{}' does not exist. Creating from image '{}'...",
-                            runner_name, image
-                        );
-
-                        // For meda, we use the image name directly (template_name parameter contains the image)
-                        let run_request = VmRunRequest {
-                            image: image.to_string(),
-                            name: Some(runner_name.to_string()),
-                            memory: Some(format!("{}G", resources.memory)),
-                            cpus: Some(resources.cpu),
-                            disk_size: Some(format!("{}G", resources.disk)),
-                        };
-
-                        match meda.run_vm(run_request).await {
-                            Ok(_) => {
-                                info!("VM '{}' created and started successfully", runner_name);
-                            }
-                            Err(e) => {
-                                error!("Failed to create and run VM '{}': {:?}", runner_name, e);
-                                let err_msg = format!(
-                                    "Failed to create and run VM from image '{}': {:?}",
-                                    image, e
-                                );
-                                // Attempt cleanup
-                                let _ = Self::cleanup_failed_runner(runner_name).await;
-                                return Err(err_msg.into());
-                            }
-                        }
-                    }
-                }
-
-                // Wait for VM to get an IP address
-                info!("Waiting for VM '{}' to get an IP address...", runner_name);
-                let ip_address = match meda.wait_for_vm_ip(runner_name, 300).await {
-                    Ok(ip) => ip,
-                    Err(e) => {
-                        error!("Failed to get VM IP address: {:?}", e);
-                        // Cleanup the failed runner VM
-                        let _ = Self::cleanup_failed_runner(runner_name).await;
-                        return Err(e.into());
-                    }
-                };
-
-                info!("VM '{}' has IP address: {}", runner_name, ip_address);
-
-                info!("Provisioning runner: {}", runner_name);
-                info!("Running provision script on VM");
-
-                // For meda, we need to use a simplified approach since we don't have the lume client
-                // We'll use run_script_on_vm but we need to adapt it for meda
-                match run_script_on_vm_meda(
-                    &meda,
-                    runner_name,
-                    &ip_address,
-                    provision_script,
-                    runner_login,
-                    true,
-                )
-                .await
-                {
-                    Ok(output) => {
-                        info!("Runner provisioning completed successfully");
-                        info!("Script output: {}", output);
-                        Ok(())
-                    }
-                    Err(e) => {
-                        error!("Failed to provision runner: {}", e);
-                        // Cleanup the failed runner VM
-                        let _ = Self::cleanup_failed_runner(runner_name).await;
-                        Err(e)
-                    }
-                }
-            }
-            Err(e) => {
-                error!("Failed to initialize Meda client: {:?}", e);
-                Err(e.into())
-            }
-        }
-    }
 
     async fn delete_runner(&self, runner_name: &str) -> Result<(), Box<dyn std::error::Error>> {
         if use_meda() {
@@ -909,180 +977,107 @@ impl CirunClient {
                 json.runners_to_provision.len()
             );
 
+            // First, handle retry-exhausted runners (notify API, skip them)
             for runner in &json.runners_to_provision {
-                // Check VM capacity before each provisioning attempt
-                if let Some(max_vms) = self.max_vms {
-                    match check_vm_capacity(max_vms).await {
-                        Ok(false) => {
-                            info!(
-                                "VM capacity limit reached ({} max). Skipping remaining provisioning.",
-                                max_vms
-                            );
-                            break;
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Failed to check VM capacity: {}. Continuing with provisioning...",
-                                e
-                            );
-                        }
-                        Ok(true) => {}
-                    }
-                }
-                // Check retry count before attempting provisioning
-                let max_retries = runner.max_retries;
                 let current_attempts = self.get_retry_count(&runner.name);
-
-                if !self.should_retry(&runner.name, max_retries) {
+                if !self.should_retry(&runner.name, runner.max_retries) {
                     warn!(
                         "Runner '{}' has exceeded max retries ({}/{}). Skipping provisioning.",
-                        runner.name, current_attempts, max_retries
+                        runner.name, current_attempts, runner.max_retries
                     );
-                    // Notify API about final failure
                     self.notify_provision_failure(
                         &runner.name,
-                        format!("Exceeded max retries ({})", max_retries),
+                        format!("Exceeded max retries ({})", runner.max_retries),
                         current_attempts,
                     )
                     .await;
-                    continue;
                 }
+            }
 
-                info!(
-                    "Processing runner: {} (attempt {}/{})",
-                    runner.name,
-                    current_attempts + 1,
-                    max_retries
-                );
-                info!("  - Image: {}", runner.image);
-                info!("  - OS: {}", runner.os);
-                info!(
-                    "  - CPU: {}, Memory: {}GB, Disk: {}GB",
-                    runner.cpu, runner.memory, runner.disk
-                );
+            // Collect eligible runners (not retry-exhausted)
+            let eligible_runners: Vec<RunnerToProvision> = json
+                .runners_to_provision
+                .iter()
+                .filter(|r| self.should_retry(&r.name, r.max_retries))
+                .cloned()
+                .collect();
 
-                // Create a template config from the runner specification
-                // Detect registry from image name - default to ghcr.io unless explicitly specified
-                let (registry, image) = if runner.image.contains('.')
-                    && runner.image.split('/').next().unwrap().contains('.')
-                {
-                    // Image has explicit registry prefix (e.g., ghcr.io/org/image, docker.io/library/ubuntu)
-                    let parts: Vec<&str> = runner.image.splitn(2, '/').collect();
-                    if parts.len() == 2 {
-                        (Some(parts[0].to_string()), parts[1].to_string())
-                    } else {
-                        (Some("ghcr.io".to_string()), runner.image.clone())
-                    }
-                } else {
-                    // No explicit registry - default to ghcr.io
-                    (Some("ghcr.io".to_string()), runner.image.clone())
-                };
-
-                let template_config = TemplateConfig {
-                    image,
-                    registry,
-                    organization: None, // Will be extracted from image name
-                    cpu: runner.cpu,
-                    memory: runner.memory,
-                    disk: runner.disk,
-                    os: runner.os.clone(),
-                };
-
-                // For meda (Linux), use the image name directly. Templates are only for lume (macOS).
-                let template_name = if use_meda() {
-                    info!(
-                        "Using meda on Linux - using image name directly: {}",
-                        runner.image
-                    );
-                    Some(runner.image.clone())
-                } else {
-                    // For lume (macOS), try to find an existing template with matching configuration
-                    if let Some(existing_template) = find_matching_template(&template_config).await
-                    {
-                        info!(
-                            "Found existing template with matching configuration: {}",
-                            existing_template
-                        );
-                        Some(existing_template)
-                    } else {
-                        // Generate a new template name
-                        let generated_name = generate_template_name(&template_config);
-
-                        // Check if the template with this specific name already exists
-                        let template_exists = check_template_exists(&generated_name).await;
-
-                        if !template_exists {
-                            // Create the template if it doesn't exist
-                            info!("No matching template found. Creating new template '{}' from image '{}'",
-                                 generated_name, template_config.image);
-
-                            match create_template(&template_config, &generated_name).await {
-                                Ok(_) => {
-                                    info!("✅ Successfully created template: {}", generated_name);
-                                    Some(generated_name)
-                                }
-                                Err(e) => {
-                                    error!(
-                                        "❌ Failed to create template {}: {}",
-                                        generated_name, e
-                                    );
-                                    error!(
-                                        "Skipping runner '{}' due to template creation failure",
-                                        runner.name
-                                    );
-                                    None
-                                }
-                            }
-                        } else {
-                            info!("Using existing template: {}", generated_name);
-                            Some(generated_name)
-                        }
-                    }
-                };
-
-                // Provision the runner using the template (only if we have a valid template)
-                if let Some(template_name) = template_name {
-                    info!(
-                        "Provisioning runner '{}' with template '{}'",
-                        runner.name, template_name
-                    );
-
-                    let resources = RunnerResources {
-                        cpu: runner.cpu,
-                        memory: runner.memory,
-                        disk: runner.disk,
-                    };
-
-                    match self
-                        .provision_runner(
-                            &runner.name,
-                            &runner.provision_script,
-                            &template_name,
-                            &runner.login,
-                            &resources,
-                        )
-                        .await
-                    {
-                        Ok(_) => {
+            if !eligible_runners.is_empty() {
+                // Calculate available slots based on VM capacity
+                let available_slots = if let Some(max_vms) = self.max_vms {
+                    match get_running_vm_count().await {
+                        Ok(running_count) => {
+                            let slots = (max_vms as usize).saturating_sub(running_count);
                             info!(
-                                "✅ Successfully provisioned runner: {} using template {}",
-                                runner.name, template_name
+                                "VM capacity: {}/{} running, {} slots available, {} runners requested",
+                                running_count, max_vms, slots, eligible_runners.len()
                             );
-                            // Clear retry count on success
-                            self.clear_retry(&runner.name);
-                            self.report_running_vms().await;
+                            if slots == 0 {
+                                info!("No VM slots available. Runners will be picked up on next poll.");
+                            }
+                            slots
                         }
                         Err(e) => {
-                            let error_msg = format!("{}", e);
-                            error!(
-                                "❌ Failed to provision runner {} using template {}: {}",
-                                runner.name, template_name, error_msg
+                            warn!(
+                                "Failed to check VM capacity: {}. Using runner count as limit.",
+                                e
                             );
-                            // Increment retry count and notify API
-                            let attempt = self.increment_retry(&runner.name);
-                            self.notify_provision_failure(&runner.name, error_msg, attempt)
-                                .await;
+                            eligible_runners.len()
                         }
+                    }
+                } else {
+                    eligible_runners.len()
+                };
+
+                if available_slots > 0 {
+                    // Cap runners to available slots
+                    let runners_to_spawn: Vec<RunnerToProvision> = eligible_runners
+                        .into_iter()
+                        .take(available_slots)
+                        .collect();
+
+                    info!(
+                        "Spawning {} runners in parallel (max concurrency: {})",
+                        runners_to_spawn.len(),
+                        available_slots
+                    );
+
+                    let semaphore = Arc::new(Semaphore::new(available_slots));
+                    let mut join_set = JoinSet::new();
+
+                    for runner in runners_to_spawn {
+                        let sem = semaphore.clone();
+                        join_set.spawn(provision_single_runner(runner, sem));
+                    }
+
+                    // Collect results
+                    let mut any_succeeded = false;
+                    while let Some(result) = join_set.join_next().await {
+                        match result {
+                            Ok(pr) => match pr.outcome {
+                                Ok(()) => {
+                                    self.clear_retry(&pr.runner_name);
+                                    any_succeeded = true;
+                                }
+                                Err(error_msg) => {
+                                    let attempt = self.increment_retry(&pr.runner_name);
+                                    self.notify_provision_failure(
+                                        &pr.runner_name,
+                                        error_msg,
+                                        attempt,
+                                    )
+                                    .await;
+                                }
+                            },
+                            Err(e) => {
+                                error!("Provisioning task panicked: {}", e);
+                            }
+                        }
+                    }
+
+                    // Report VMs once after all provisioning completes
+                    if any_succeeded {
+                        self.report_running_vms().await;
                     }
                 }
             }
