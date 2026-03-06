@@ -1375,8 +1375,8 @@ async fn run_script_on_vm_meda(
     ];
 
     // Step 4: Test SSH connection with retries (SSH may not be ready immediately after VM boot)
-    info!("Waiting for SSH to be ready on VM (max 60 seconds)...");
-    let max_ssh_retries = 12; // 12 retries * 5 seconds = 60 seconds max
+    info!("Waiting for SSH to be ready on VM (max 30 seconds)...");
+    let max_ssh_retries = 6; // 6 retries * 5 seconds = 30 seconds max
     let mut ssh_ready = false;
 
     for attempt in 1..=max_ssh_retries {
