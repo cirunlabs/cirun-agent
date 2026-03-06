@@ -936,6 +936,7 @@ impl CirunClient {
     async fn manage_runner_lifecycle(
         &mut self,
         provision_set: &mut JoinSet<ProvisionResult>,
+        in_flight: &mut std::collections::HashSet<String>,
     ) -> Result<ApiResponse, Error> {
         let url = format!("{}/agent", self.base_url);
         info!("Fetching runner provision/deletion data from: {}", url);
@@ -997,11 +998,19 @@ impl CirunClient {
                 }
             }
 
-            // Collect eligible runners (not retry-exhausted)
+            // Collect eligible runners (not retry-exhausted, not already in-flight)
             let eligible_runners: Vec<RunnerToProvision> = json
                 .runners_to_provision
                 .iter()
                 .filter(|r| self.should_retry(&r.name, r.max_retries))
+                .filter(|r| {
+                    if in_flight.contains(&r.name) {
+                        info!("Skipping runner '{}' — already in-flight", r.name);
+                        false
+                    } else {
+                        true
+                    }
+                })
                 .cloned()
                 .collect();
 
@@ -1048,6 +1057,7 @@ impl CirunClient {
                     let semaphore = Arc::new(Semaphore::new(available_slots));
 
                     for runner in runners_to_spawn {
+                        in_flight.insert(runner.name.clone());
                         let sem = semaphore.clone();
                         provision_set.spawn(provision_single_runner(runner, sem));
                     }
@@ -1661,6 +1671,8 @@ async fn main() {
     // Persistent JoinSet for provisioning tasks — lives across loop iterations
     // so in-flight tasks don't block polling.
     let mut provision_set: JoinSet<ProvisionResult> = JoinSet::new();
+    // Track runner names currently being provisioned to avoid spawning duplicates.
+    let mut in_flight: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Main loop
     loop {
@@ -1668,18 +1680,21 @@ async fn main() {
         let mut any_provision_succeeded = false;
         while let Some(result) = provision_set.try_join_next() {
             match result {
-                Ok(pr) => match pr.outcome {
-                    Ok(()) => {
-                        client.clear_retry(&pr.runner_name);
-                        any_provision_succeeded = true;
+                Ok(pr) => {
+                    in_flight.remove(&pr.runner_name);
+                    match pr.outcome {
+                        Ok(()) => {
+                            client.clear_retry(&pr.runner_name);
+                            any_provision_succeeded = true;
+                        }
+                        Err(error_msg) => {
+                            let attempt = client.increment_retry(&pr.runner_name);
+                            client
+                                .notify_provision_failure(&pr.runner_name, error_msg, attempt)
+                                .await;
+                        }
                     }
-                    Err(error_msg) => {
-                        let attempt = client.increment_retry(&pr.runner_name);
-                        client
-                            .notify_provision_failure(&pr.runner_name, error_msg, attempt)
-                            .await;
-                    }
-                },
+                }
                 Err(e) => {
                     error!("Provisioning task panicked: {}", e);
                 }
@@ -1690,7 +1705,10 @@ async fn main() {
             client.report_running_vms().await;
         }
 
-        match client.manage_runner_lifecycle(&mut provision_set).await {
+        match client
+            .manage_runner_lifecycle(&mut provision_set, &mut in_flight)
+            .await
+        {
             Ok(response) => {
                 info!(
                     "Attempted runners to provision: {}",
