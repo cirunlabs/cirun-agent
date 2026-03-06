@@ -1344,9 +1344,9 @@ async fn run_script_on_vm_meda(
 ) -> Result<String, Box<dyn std::error::Error>> {
     use std::fs::{remove_file, File};
     use std::io::Write;
-    use std::process::{Command, Stdio};
     use std::time::Instant;
     use tempfile::NamedTempFile;
+    use tokio::process::Command;
 
     info!("VM '{}' is ready with IP: {}", vm_name, ip_address);
 
@@ -1405,9 +1405,10 @@ async fn run_script_on_vm_meda(
             .args(&ssh_options)
             .arg(format!("{}@{}", login.username, ip_address))
             .arg("echo 'SSH connection test successful'")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()?;
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .await?;
 
         if output.status.success() {
             info!(
@@ -1451,9 +1452,10 @@ async fn run_script_on_vm_meda(
             "{}@{}:{}",
             login.username, ip_address, remote_script_path
         ))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()?;
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await?;
 
     if !output.status.success() {
         let error_msg = String::from_utf8_lossy(&output.stderr);
@@ -1476,9 +1478,10 @@ async fn run_script_on_vm_meda(
                 "chmod +x {} && sudo nohup bash {} > /tmp/script_stdout.log 2> /tmp/script_stderr.log & echo $!",
                 remote_script_path, remote_script_path
             ))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()?
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .await?
     } else {
         info!("Executing script on VM and waiting for completion with sudo");
         Command::new("sshpass")
@@ -1491,9 +1494,10 @@ async fn run_script_on_vm_meda(
                 "chmod +x {} && sudo bash {}",
                 remote_script_path, remote_script_path
             ))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()?
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .await?
     };
 
     // Step 7: Clean up password file
