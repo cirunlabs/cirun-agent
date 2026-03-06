@@ -2,9 +2,10 @@ use crate::lume::{LumeClient, RunConfig};
 use log::{error, info, warn};
 use std::fs::{remove_file, File};
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
+use tokio::process::Command;
 use tokio::time::sleep;
 
 use anyhow::Result;
@@ -43,7 +44,7 @@ pub async fn run_script_on_vm(
         };
 
         start_vm
-            .retry(ExponentialBuilder::default())
+            .retry(ExponentialBuilder::default().with_max_times(5))
             .sleep(tokio::time::sleep)
             .when(|e| e.to_string().contains("Failed to start VM"))
             .notify(|err, dur| warn!("Retrying VM start after {:?}: {:?}", dur, err))
@@ -80,19 +81,25 @@ pub async fn run_script_on_vm(
         "ConnectTimeout=10",
     ];
 
-    // Step 7: Test SSH connection with retries
+    // Step 7: Test SSH connection with retries (capped at 10 retries, 30s timeout per attempt)
     info!("Testing SSH connection to VM");
     let ssh_test_result = || async {
-        let output = Command::new("sshpass")
-            .arg("-f")
-            .arg(&password_file_path)
-            .arg("ssh")
-            .args(&ssh_options)
-            .arg(format!("{}@{}", username, ip_address))
-            .arg("echo 'SSH connection test successful'")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()?;
+        let output = tokio::time::timeout(
+            tokio::time::Duration::from_secs(30),
+            Command::new("sshpass")
+                .arg("-f")
+                .arg(&password_file_path)
+                .arg("ssh")
+                .args(&ssh_options)
+                .arg(format!("{}@{}", username, ip_address))
+                .arg("echo 'SSH connection test successful'")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("SSH connection timed out after 30s"))?
+        .map_err(|e| anyhow::anyhow!("SSH command error: {}", e))?;
 
         if !output.status.success() {
             Err(anyhow::anyhow!(
@@ -105,9 +112,12 @@ pub async fn run_script_on_vm(
     };
 
     ssh_test_result
-        .retry(ExponentialBuilder::default())
+        .retry(ExponentialBuilder::default().with_max_times(10))
         .sleep(tokio::time::sleep)
-        .when(|e| e.to_string().contains("SSH connection failed"))
+        .when(|e| {
+            let msg = e.to_string();
+            msg.contains("SSH connection failed") || msg.contains("SSH connection timed out")
+        })
         .notify(|err, dur| warn!("Retrying SSH connection after {:?}: {:?}", dur, err))
         .await?;
 
@@ -118,19 +128,25 @@ pub async fn run_script_on_vm(
     info!("Copying script to VM at {}", remote_script_path);
 
     let scp_transfer = || async {
-        let output = Command::new("sshpass")
-            .arg("-f")
-            .arg(&password_file_path)
-            .arg("scp")
-            .args(&ssh_options)
-            .arg(temp_file_path)
-            .arg(format!(
-                "{}@{}:{}",
-                username, ip_address, remote_script_path
-            ))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()?;
+        let output = tokio::time::timeout(
+            tokio::time::Duration::from_secs(60),
+            Command::new("sshpass")
+                .arg("-f")
+                .arg(&password_file_path)
+                .arg("scp")
+                .args(&ssh_options)
+                .arg(temp_file_path)
+                .arg(format!(
+                    "{}@{}:{}",
+                    username, ip_address, remote_script_path
+                ))
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("SCP transfer timed out after 60s"))?
+        .map_err(|e| anyhow::anyhow!("SCP command error: {}", e))?;
 
         if !output.status.success() {
             Err(anyhow::anyhow!(
@@ -143,46 +159,59 @@ pub async fn run_script_on_vm(
     };
 
     scp_transfer
-        .retry(ExponentialBuilder::default())
+        .retry(ExponentialBuilder::default().with_max_times(5))
         .sleep(tokio::time::sleep)
-        .when(|e| e.to_string().contains("SCP failed"))
+        .when(|e| {
+            let msg = e.to_string();
+            msg.contains("SCP failed") || msg.contains("SCP transfer timed out")
+        })
         .notify(|err, dur| warn!("Retrying SCP transfer after {:?}: {:?}", dur, err))
         .await?;
 
     info!("✔ SCP transfer successful");
 
-    // Step 9: Execute the script on the VM with retries
+    // Step 9: Execute the script on the VM with retries (capped at 3 retries, with timeout)
     let execute_script = || async {
-        let output = if run_detached {
-            // Execute in detached mode
+        let (timeout_secs, cmd_future) = if run_detached {
             info!("Executing script on VM in detached mode");
-            Command::new("sshpass")
-                .arg("-f").arg(&password_file_path)
-                .arg("ssh")
-                .args(&ssh_options)
-                .arg(format!("{}@{}", username, ip_address))
-                .arg(format!("chmod +x {} && nohup {} > /tmp/script_stdout.log 2> /tmp/script_stderr.log & echo $!",
-                             remote_script_path, remote_script_path))
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output()?
+            (
+                60u64,
+                Command::new("sshpass")
+                    .arg("-f").arg(&password_file_path)
+                    .arg("ssh")
+                    .args(&ssh_options)
+                    .arg(format!("{}@{}", username, ip_address))
+                    .arg(format!("chmod +x {} && nohup {} > /tmp/script_stdout.log 2> /tmp/script_stderr.log & echo $!",
+                                 remote_script_path, remote_script_path))
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output(),
+            )
         } else {
-            // Execute in normal mode
             info!("Executing script on VM and waiting for completion");
-            Command::new("sshpass")
-                .arg("-f")
-                .arg(&password_file_path)
-                .arg("ssh")
-                .args(&ssh_options)
-                .arg(format!("{}@{}", username, ip_address))
-                .arg(format!(
-                    "chmod +x {} && {}",
-                    remote_script_path, remote_script_path
-                ))
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output()?
+            (
+                600u64,
+                Command::new("sshpass")
+                    .arg("-f")
+                    .arg(&password_file_path)
+                    .arg("ssh")
+                    .args(&ssh_options)
+                    .arg(format!("{}@{}", username, ip_address))
+                    .arg(format!(
+                        "chmod +x {} && {}",
+                        remote_script_path, remote_script_path
+                    ))
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output(),
+            )
         };
+
+        let output =
+            tokio::time::timeout(tokio::time::Duration::from_secs(timeout_secs), cmd_future)
+                .await
+                .map_err(|_| anyhow::anyhow!("Script execution timed out after {}s", timeout_secs))?
+                .map_err(|e| anyhow::anyhow!("Script command error: {}", e))?;
 
         if !output.status.success() {
             Err(anyhow::anyhow!(
@@ -195,9 +224,12 @@ pub async fn run_script_on_vm(
     };
 
     let script_output = execute_script
-        .retry(ExponentialBuilder::default())
+        .retry(ExponentialBuilder::default().with_max_times(3))
         .sleep(tokio::time::sleep)
-        .when(|e| e.to_string().contains("Script execution failed"))
+        .when(|e| {
+            let msg = e.to_string();
+            msg.contains("Script execution failed") || msg.contains("Script execution timed out")
+        })
         .notify(|err, dur| warn!("Retrying script execution after {:?}: {:?}", dur, err))
         .await?;
 
