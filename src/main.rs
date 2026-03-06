@@ -1329,7 +1329,6 @@ async fn run_script_on_vm_meda(
     login: &RunnerLogin,
     run_detached: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    use std::fs::{remove_file, File};
     use std::io::Write;
     use std::time::Instant;
     use tempfile::NamedTempFile;
@@ -1346,28 +1345,10 @@ async fn run_script_on_vm_meda(
         .to_str()
         .ok_or("Failed to get temporary file path")?;
 
-    // Step 2: Create a temporary password file for sshpass
-    let temp_dir = std::env::temp_dir();
-    let password_file_path = temp_dir.join(format!(
-        "sshpass_{}.txt",
-        Instant::now().elapsed().as_millis()
-    ));
-
-    let mut file = File::create(&password_file_path)?;
-    file.write_all(login.password.as_bytes())?;
-
-    // Restrict permissions on the password file
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let metadata = file.metadata()?;
-        let mut permissions = metadata.permissions();
-        permissions.set_mode(0o600);
-        std::fs::set_permissions(&password_file_path, permissions)?;
-    }
-
-    let password_file_str = password_file_path.to_string_lossy().to_string();
-    info!("Created temporary password file for SSH authentication");
+    // Step 2: Resolve SSH private key path
+    let home_dir = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let ssh_key_path = format!("{}/.meda/ssh/id_ed25519", home_dir);
+    info!("Using SSH key authentication: {}", ssh_key_path);
 
     // Step 3: Setup SSH options
     let ssh_options = vec![
@@ -1387,10 +1368,9 @@ async fn run_script_on_vm_meda(
     for attempt in 1..=max_ssh_retries {
         let output = match tokio::time::timeout(
             tokio::time::Duration::from_secs(30),
-            Command::new("sshpass")
-                .arg("-f")
-                .arg(&password_file_str)
-                .arg("ssh")
+            Command::new("ssh")
+                .arg("-i")
+                .arg(&ssh_key_path)
                 .args(&ssh_options)
                 .arg(format!("{}@{}", login.username, ip_address))
                 .arg("echo 'SSH connection test successful'")
@@ -1435,7 +1415,6 @@ async fn run_script_on_vm_meda(
     }
 
     if !ssh_ready {
-        remove_file(&password_file_path).ok();
         return Err(
             "SSH connection failed after multiple retries - VM may not be fully booted".into(),
         );
@@ -1447,10 +1426,9 @@ async fn run_script_on_vm_meda(
 
     let output = tokio::time::timeout(
         tokio::time::Duration::from_secs(60),
-        Command::new("sshpass")
-            .arg("-f")
-            .arg(&password_file_str)
-            .arg("scp")
+        Command::new("scp")
+            .arg("-i")
+            .arg(&ssh_key_path)
             .args(&ssh_options)
             .arg(temp_file_path)
             .arg(format!(
@@ -1466,7 +1444,6 @@ async fn run_script_on_vm_meda(
 
     if !output.status.success() {
         let error_msg = String::from_utf8_lossy(&output.stderr);
-        remove_file(&password_file_path).ok();
         return Err(format!("SCP failed: {}", error_msg).into());
     }
 
@@ -1478,10 +1455,9 @@ async fn run_script_on_vm_meda(
         info!("Executing script on VM in detached mode with sudo");
         (
             60u64,
-            Command::new("sshpass")
-                .arg("-f")
-                .arg(&password_file_str)
-                .arg("ssh")
+            Command::new("ssh")
+                .arg("-i")
+                .arg(&ssh_key_path)
                 .args(&ssh_options)
                 .arg(format!("{}@{}", login.username, ip_address))
                 .arg(format!(
@@ -1496,10 +1472,9 @@ async fn run_script_on_vm_meda(
         info!("Executing script on VM and waiting for completion with sudo");
         (
             600u64,
-            Command::new("sshpass")
-                .arg("-f")
-                .arg(&password_file_str)
-                .arg("ssh")
+            Command::new("ssh")
+                .arg("-i")
+                .arg(&ssh_key_path)
                 .args(&ssh_options)
                 .arg(format!("{}@{}", login.username, ip_address))
                 .arg(format!(
@@ -1518,9 +1493,6 @@ async fn run_script_on_vm_meda(
     )
     .await
     .map_err(|_| format!("Script execution timed out after {}s", script_timeout_secs))??;
-
-    // Step 7: Clean up password file
-    remove_file(&password_file_path).ok();
 
     if !output.status.success() {
         let error_msg = String::from_utf8_lossy(&output.stderr);
