@@ -933,7 +933,10 @@ impl CirunClient {
         }
     }
 
-    async fn manage_runner_lifecycle(&mut self) -> Result<ApiResponse, Error> {
+    async fn manage_runner_lifecycle(
+        &mut self,
+        provision_set: &mut JoinSet<ProvisionResult>,
+    ) -> Result<ApiResponse, Error> {
         let url = format!("{}/agent", self.base_url);
         info!("Fetching runner provision/deletion data from: {}", url);
 
@@ -1043,42 +1046,16 @@ impl CirunClient {
                     );
 
                     let semaphore = Arc::new(Semaphore::new(available_slots));
-                    let mut join_set = JoinSet::new();
 
                     for runner in runners_to_spawn {
                         let sem = semaphore.clone();
-                        join_set.spawn(provision_single_runner(runner, sem));
+                        provision_set.spawn(provision_single_runner(runner, sem));
                     }
 
-                    // Collect results
-                    let mut any_succeeded = false;
-                    while let Some(result) = join_set.join_next().await {
-                        match result {
-                            Ok(pr) => match pr.outcome {
-                                Ok(()) => {
-                                    self.clear_retry(&pr.runner_name);
-                                    any_succeeded = true;
-                                }
-                                Err(error_msg) => {
-                                    let attempt = self.increment_retry(&pr.runner_name);
-                                    self.notify_provision_failure(
-                                        &pr.runner_name,
-                                        error_msg,
-                                        attempt,
-                                    )
-                                    .await;
-                                }
-                            },
-                            Err(e) => {
-                                error!("Provisioning task panicked: {}", e);
-                            }
-                        }
-                    }
-
-                    // Report VMs once after all provisioning completes
-                    if any_succeeded {
-                        self.report_running_vms().await;
-                    }
+                    info!(
+                        "Spawned provisioning tasks. Total in-flight: {}",
+                        provision_set.len()
+                    );
                 }
             }
         }
@@ -1398,17 +1375,33 @@ async fn run_script_on_vm_meda(
     let mut ssh_ready = false;
 
     for attempt in 1..=max_ssh_retries {
-        let output = Command::new("sshpass")
-            .arg("-f")
-            .arg(&password_file_str)
-            .arg("ssh")
-            .args(&ssh_options)
-            .arg(format!("{}@{}", login.username, ip_address))
-            .arg("echo 'SSH connection test successful'")
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .await?;
+        let output = match tokio::time::timeout(
+            tokio::time::Duration::from_secs(30),
+            Command::new("sshpass")
+                .arg("-f")
+                .arg(&password_file_str)
+                .arg("ssh")
+                .args(&ssh_options)
+                .arg(format!("{}@{}", login.username, ip_address))
+                .arg("echo 'SSH connection test successful'")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output(),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                warn!(
+                    "SSH connection test timed out after 30s (attempt {}/{})",
+                    attempt, max_ssh_retries
+                );
+                if attempt < max_ssh_retries {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                }
+                continue;
+            }
+        };
 
         if output.status.success() {
             info!(
@@ -1442,20 +1435,24 @@ async fn run_script_on_vm_meda(
     let remote_script_path = format!("/tmp/script_{}.sh", Instant::now().elapsed().as_secs());
     info!("Copying script to VM at {}", remote_script_path);
 
-    let output = Command::new("sshpass")
-        .arg("-f")
-        .arg(&password_file_str)
-        .arg("scp")
-        .args(&ssh_options)
-        .arg(temp_file_path)
-        .arg(format!(
-            "{}@{}:{}",
-            login.username, ip_address, remote_script_path
-        ))
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .await?;
+    let output = tokio::time::timeout(
+        tokio::time::Duration::from_secs(60),
+        Command::new("sshpass")
+            .arg("-f")
+            .arg(&password_file_str)
+            .arg("scp")
+            .args(&ssh_options)
+            .arg(temp_file_path)
+            .arg(format!(
+                "{}@{}:{}",
+                login.username, ip_address, remote_script_path
+            ))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output(),
+    )
+    .await
+    .map_err(|_| "SCP transfer timed out after 60s")??;
 
     if !output.status.success() {
         let error_msg = String::from_utf8_lossy(&output.stderr);
@@ -1466,39 +1463,51 @@ async fn run_script_on_vm_meda(
     info!("✔ SCP transfer successful");
 
     // Step 6: Execute the script on the VM with sudo (provision scripts need root privileges)
-    let output = if run_detached {
+    // Detached mode gets a short timeout (just needs to launch); blocking mode gets longer.
+    let (script_timeout_secs, script_future) = if run_detached {
         info!("Executing script on VM in detached mode with sudo");
-        Command::new("sshpass")
-            .arg("-f")
-            .arg(&password_file_str)
-            .arg("ssh")
-            .args(&ssh_options)
-            .arg(format!("{}@{}", login.username, ip_address))
-            .arg(format!(
-                "chmod +x {} && sudo nohup bash {} > /tmp/script_stdout.log 2> /tmp/script_stderr.log & echo $!",
-                remote_script_path, remote_script_path
-            ))
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .await?
+        (
+            60u64,
+            Command::new("sshpass")
+                .arg("-f")
+                .arg(&password_file_str)
+                .arg("ssh")
+                .args(&ssh_options)
+                .arg(format!("{}@{}", login.username, ip_address))
+                .arg(format!(
+                    "chmod +x {} && sudo nohup bash {} > /tmp/script_stdout.log 2> /tmp/script_stderr.log & echo $!",
+                    remote_script_path, remote_script_path
+                ))
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output(),
+        )
     } else {
         info!("Executing script on VM and waiting for completion with sudo");
-        Command::new("sshpass")
-            .arg("-f")
-            .arg(&password_file_str)
-            .arg("ssh")
-            .args(&ssh_options)
-            .arg(format!("{}@{}", login.username, ip_address))
-            .arg(format!(
-                "chmod +x {} && sudo bash {}",
-                remote_script_path, remote_script_path
-            ))
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .await?
+        (
+            600u64,
+            Command::new("sshpass")
+                .arg("-f")
+                .arg(&password_file_str)
+                .arg("ssh")
+                .args(&ssh_options)
+                .arg(format!("{}@{}", login.username, ip_address))
+                .arg(format!(
+                    "chmod +x {} && sudo bash {}",
+                    remote_script_path, remote_script_path
+                ))
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output(),
+        )
     };
+
+    let output = tokio::time::timeout(
+        tokio::time::Duration::from_secs(script_timeout_secs),
+        script_future,
+    )
+    .await
+    .map_err(|_| format!("Script execution timed out after {}s", script_timeout_secs))??;
 
     // Step 7: Clean up password file
     remove_file(&password_file_path).ok();
@@ -1649,9 +1658,39 @@ async fn main() {
     let mut last_cleanup = SystemTime::now();
     let cleanup_interval = Duration::from_secs(24 * 60 * 60); // Daily log cleanup
 
+    // Persistent JoinSet for provisioning tasks — lives across loop iterations
+    // so in-flight tasks don't block polling.
+    let mut provision_set: JoinSet<ProvisionResult> = JoinSet::new();
+
     // Main loop
     loop {
-        match client.manage_runner_lifecycle().await {
+        // Drain completed provisioning results (non-blocking)
+        let mut any_provision_succeeded = false;
+        while let Some(result) = provision_set.try_join_next() {
+            match result {
+                Ok(pr) => match pr.outcome {
+                    Ok(()) => {
+                        client.clear_retry(&pr.runner_name);
+                        any_provision_succeeded = true;
+                    }
+                    Err(error_msg) => {
+                        let attempt = client.increment_retry(&pr.runner_name);
+                        client
+                            .notify_provision_failure(&pr.runner_name, error_msg, attempt)
+                            .await;
+                    }
+                },
+                Err(e) => {
+                    error!("Provisioning task panicked: {}", e);
+                }
+            }
+        }
+
+        if any_provision_succeeded {
+            client.report_running_vms().await;
+        }
+
+        match client.manage_runner_lifecycle(&mut provision_set).await {
             Ok(response) => {
                 info!(
                     "Attempted runners to provision: {}",
