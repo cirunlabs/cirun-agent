@@ -162,7 +162,6 @@ async fn get_running_vm_count() -> Result<usize, Box<dyn std::error::Error>> {
     }
 }
 
-
 /// Result of a single runner provisioning attempt
 struct ProvisionResult {
     runner_name: String,
@@ -183,18 +182,17 @@ async fn provision_single_runner(
     );
 
     // Parse registry from image name
-    let (registry, image) = if runner.image.contains('.')
-        && runner.image.split('/').next().unwrap().contains('.')
-    {
-        let parts: Vec<&str> = runner.image.splitn(2, '/').collect();
-        if parts.len() == 2 {
-            (Some(parts[0].to_string()), parts[1].to_string())
+    let (registry, image) =
+        if runner.image.contains('.') && runner.image.split('/').next().unwrap().contains('.') {
+            let parts: Vec<&str> = runner.image.splitn(2, '/').collect();
+            if parts.len() == 2 {
+                (Some(parts[0].to_string()), parts[1].to_string())
+            } else {
+                (Some("ghcr.io".to_string()), runner.image.clone())
+            }
         } else {
             (Some("ghcr.io".to_string()), runner.image.clone())
-        }
-    } else {
-        (Some("ghcr.io".to_string()), runner.image.clone())
-    };
+        };
 
     let template_config = TemplateConfig {
         image,
@@ -357,11 +355,12 @@ async fn do_provision_meda(
                 disk_size: Some(format!("{}G", resources.disk)),
             };
 
-            if let Err(err_msg) = meda
-                .run_vm(run_request)
-                .await
-                .map_err(|e| format!("Failed to create and run VM from image '{}': {:?}", image, e))
-            {
+            if let Err(err_msg) = meda.run_vm(run_request).await.map_err(|e| {
+                format!(
+                    "Failed to create and run VM from image '{}': {:?}",
+                    image, e
+                )
+            }) {
                 error!("{}", err_msg);
                 let _ = CirunClient::cleanup_failed_runner(runner_name).await;
                 return Err(err_msg);
@@ -387,9 +386,16 @@ async fn do_provision_meda(
     info!("VM '{}' has IP address: {}", runner_name, ip_address);
     info!("Provisioning runner: {}", runner_name);
 
-    match run_script_on_vm_meda(&meda, runner_name, &ip_address, provision_script, runner_login, true)
-        .await
-        .map_err(|e| format!("Failed to provision runner: {}", e))
+    match run_script_on_vm_meda(
+        &meda,
+        runner_name,
+        &ip_address,
+        provision_script,
+        runner_login,
+        true,
+    )
+    .await
+    .map_err(|e| format!("Failed to provision runner: {}", e))
     {
         Ok(output) => {
             info!("Runner provisioning completed successfully");
@@ -424,10 +430,12 @@ async fn do_provision_lume(
             runner_name, template_name
         );
 
-        let template_check = lume
-            .get_vm(template_name)
-            .await
-            .map_err(|e| format!("Template '{}' not found: {:?}. Cannot provision runner.", template_name, e));
+        let template_check = lume.get_vm(template_name).await.map_err(|e| {
+            format!(
+                "Template '{}' not found: {:?}. Cannot provision runner.",
+                template_name, e
+            )
+        });
         if let Err(err_msg) = template_check {
             return Err(err_msg);
         }
@@ -435,16 +443,21 @@ async fn do_provision_lume(
         let clone_result = lume
             .clone_vm(template_name, runner_name)
             .await
-            .map_err(|e| format!("Failed to clone VM from template '{}': {:?}", template_name, e));
+            .map_err(|e| {
+                format!(
+                    "Failed to clone VM from template '{}': {:?}",
+                    template_name, e
+                )
+            });
         match clone_result {
             Ok(_) => {
                 info!(
                     "VM '{}' cloned successfully from template '{}'",
                     runner_name, template_name
                 );
-                lume.get_vm(runner_name).await.map_err(|e| {
-                    format!("Failed to get VM after clone: {:?}", e)
-                })?
+                lume.get_vm(runner_name)
+                    .await
+                    .map_err(|e| format!("Failed to get VM after clone: {:?}", e))?
             }
             Err(err_msg) => {
                 error!("{}", err_msg);
@@ -469,9 +482,17 @@ async fn do_provision_lume(
 
     info!("Provisioning runner: {}", runner_name);
 
-    match run_script_on_vm(&lume, runner_name, provision_script, &username, &password, 20, true)
-        .await
-        .map_err(|e| format!("Failed to provision runner: {}", e))
+    match run_script_on_vm(
+        &lume,
+        runner_name,
+        provision_script,
+        &username,
+        &password,
+        20,
+        true,
+    )
+    .await
+    .map_err(|e| format!("Failed to provision runner: {}", e))
     {
         Ok(output) => {
             info!("Runner provisioning completed successfully");
@@ -794,7 +815,6 @@ impl CirunClient {
         }
     }
 
-
     async fn delete_runner(&self, runner_name: &str) -> Result<(), Box<dyn std::error::Error>> {
         if use_meda() {
             match MedaClient::new() {
@@ -1043,10 +1063,8 @@ impl CirunClient {
 
                 if available_slots > 0 {
                     // Cap runners to available slots
-                    let runners_to_spawn: Vec<RunnerToProvision> = eligible_runners
-                        .into_iter()
-                        .take(available_slots)
-                        .collect();
+                    let runners_to_spawn: Vec<RunnerToProvision> =
+                        eligible_runners.into_iter().take(available_slots).collect();
 
                     info!(
                         "Spawning {} runners in parallel (max concurrency: {})",

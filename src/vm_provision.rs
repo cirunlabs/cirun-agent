@@ -3,9 +3,9 @@ use log::{error, info, warn};
 use std::fs::{remove_file, File};
 use std::io::Write;
 use std::process::Stdio;
-use tokio::process::Command;
 use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
+use tokio::process::Command;
 use tokio::time::sleep;
 
 use anyhow::Result;
@@ -207,13 +207,11 @@ pub async fn run_script_on_vm(
             )
         };
 
-        let output = tokio::time::timeout(
-            tokio::time::Duration::from_secs(timeout_secs),
-            cmd_future,
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("Script execution timed out after {}s", timeout_secs))?
-        .map_err(|e| anyhow::anyhow!("Script command error: {}", e))?;
+        let output =
+            tokio::time::timeout(tokio::time::Duration::from_secs(timeout_secs), cmd_future)
+                .await
+                .map_err(|_| anyhow::anyhow!("Script execution timed out after {}s", timeout_secs))?
+                .map_err(|e| anyhow::anyhow!("Script command error: {}", e))?;
 
         if !output.status.success() {
             Err(anyhow::anyhow!(
