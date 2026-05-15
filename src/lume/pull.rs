@@ -1,5 +1,5 @@
+use crate::api::TemplateConfig;
 use crate::lume::client::LumeClient;
-use crate::TemplateConfig;
 use log::{error, info, warn};
 use reqwest::Client;
 use serde_json::json;
@@ -63,7 +63,7 @@ pub async fn pull_image(
                 match lume.get_vm(vm_name).await {
                     Ok(vm) => {
                         info!(
-                            "✅ VM '{}' is now available after image pull. State: {}",
+                            "[OK] VM '{}' is now available after image pull. State: {}",
                             vm_name, vm.state
                         );
                         return Ok(());
@@ -379,7 +379,7 @@ pub async fn create_template(
             }
 
             info!(
-                "✅ Template '{}' successfully created and ready for use",
+                "[OK] Template '{}' successfully created and ready for use",
                 template_name
             );
             Ok(())

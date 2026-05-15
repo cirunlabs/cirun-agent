@@ -95,34 +95,6 @@ impl MedaClient {
     }
 
     /// Start an existing VM
-    pub async fn start_vm(&self, name: &str) -> Result<(), MedaError> {
-        let url = format!("{}/vms/{}/start", self.base_url, name);
-
-        info!("Starting VM: {}", name);
-
-        let response = self.client.post(&url).send().await?;
-        let status = response.status();
-        let response_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Failed to read response body".to_string());
-
-        info!(
-            "VM Start API Response: Status = {}, Body = {}",
-            status, response_text
-        );
-
-        if !status.is_success() {
-            return Err(MedaError::ApiError(format!(
-                "Failed to start VM: {}",
-                response_text
-            )));
-        }
-
-        info!("Successfully started VM: {}", name);
-        Ok(())
-    }
-
     /// Stop a running VM
     #[allow(dead_code)]
     pub async fn stop_vm(&self, name: &str) -> Result<(), MedaError> {
