@@ -7,7 +7,10 @@ use std::{thread, time::Duration, time::SystemTime};
 use chrono::{DateTime, Utc};
 use std::path::Path;
 
-/// Check if meda serve process is currently running
+/// Check if meda serve process is currently running.
+/// Only callable on Linux (meda is a linux-only KVM helper); other platforms
+/// build it but never invoke it.
+#[allow(dead_code)]
 pub fn is_meda_running() -> bool {
     Command::new("pgrep")
         .arg("-f")
@@ -18,6 +21,7 @@ pub fn is_meda_running() -> bool {
         .unwrap_or(false)
 }
 
+#[allow(dead_code)]
 pub async fn download_and_run_meda() {
     // Spawn a blocking task to handle the file operations
     let result = tokio::task::spawn_blocking(download_and_run_meda_internal).await;
@@ -124,6 +128,7 @@ pub fn cleanup_log_files(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn download_and_run_meda_internal() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let install_dir = PathBuf::from(format!("{}/.meda", std::env::var("HOME")?));
     let meda_bin_path = install_dir.join("meda");

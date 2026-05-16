@@ -1,15 +1,11 @@
 use crate::lume::{LumeClient, RunConfig};
-use log::{error, info, warn};
-use std::fs::{remove_file, File};
-use std::io::Write;
-use std::process::Stdio;
-use std::time::{Duration, Instant};
-use tempfile::NamedTempFile;
-use tokio::process::Command;
-use tokio::time::sleep;
-
 use anyhow::Result;
 use backon::{ExponentialBuilder, Retryable};
+use log::{error, info, warn};
+use std::io::Write;
+use std::time::{Duration, Instant};
+use tempfile::NamedTempFile;
+use tokio::time::sleep;
 
 pub async fn run_script_on_vm(
     lume: &LumeClient,
@@ -58,220 +54,94 @@ pub async fn run_script_on_vm(
     let ip_address = wait_for_vm_ip(lume, vm_name, timeout_seconds).await?;
     info!("VM is running with IP: {}", ip_address);
 
-    // Step 4: Create a temporary file for the script
+    use crate::ssh::{copy_file, exec, test_connection, SshAuth, SshTarget};
+
     info!("Creating temporary script file");
     let mut temp_file = NamedTempFile::new()?;
     temp_file.write_all(script_content.as_bytes())?;
-    let temp_file_path = temp_file
-        .path()
-        .to_str()
-        .ok_or("Failed to get temporary file path")?;
 
-    // Step 5: Create a temporary password file for sshpass
-    let password_file_path = create_password_file(password)?;
-    info!("Created temporary password file for SSH authentication");
+    // password_tmp must outlive the target (dropped on function exit auto-deletes).
+    let password_tmp = create_password_file(password)?;
+    info!(
+        "SSH target: {}@{} (password auth, password length={})",
+        username,
+        ip_address,
+        password.len()
+    );
+    let target = SshTarget::new(
+        ip_address.clone(),
+        username.to_string(),
+        SshAuth::PasswordFile(password_tmp.path().to_path_buf()),
+    )?;
 
-    // Step 6: Setup SSH options
-    let ssh_options = vec![
-        "-o",
-        "StrictHostKeyChecking=no",
-        "-o",
-        "UserKnownHostsFile=/dev/null",
-        "-o",
-        "ConnectTimeout=10",
-    ];
-
-    // Step 7: Test SSH connection with retries (capped at 10 retries, 30s timeout per attempt)
-    info!("Testing SSH connection to VM");
-    let ssh_test_result = || async {
-        let output = tokio::time::timeout(
-            tokio::time::Duration::from_secs(30),
-            Command::new("sshpass")
-                .arg("-f")
-                .arg(&password_file_path)
-                .arg("ssh")
-                .args(&ssh_options)
-                .arg(format!("{}@{}", username, ip_address))
-                .arg("echo 'SSH connection test successful'")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output(),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("SSH connection timed out after 30s"))?
-        .map_err(|e| anyhow::anyhow!("SSH command error: {}", e))?;
-
-        if !output.status.success() {
-            Err(anyhow::anyhow!(
-                "SSH connection failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ))
-        } else {
-            Ok(())
-        }
-    };
-
-    ssh_test_result
+    // Test SSH (VM may still be booting). Use backon for exponential retry.
+    (|| async { test_connection(&target).await })
         .retry(ExponentialBuilder::default().with_max_times(10))
         .sleep(tokio::time::sleep)
-        .when(|e| {
-            let msg = e.to_string();
-            msg.contains("SSH connection failed") || msg.contains("SSH connection timed out")
-        })
         .notify(|err, dur| warn!("Retrying SSH connection after {:?}: {:?}", dur, err))
         .await?;
-
     info!("✔ SSH connection successful");
 
-    // Step 8: Copy the script to the VM using sshpass with retries
+    // Copy script to VM (with retry).
     let remote_script_path = format!("/tmp/script_{}.sh", Instant::now().elapsed().as_secs());
-    info!("Copying script to VM at {}", remote_script_path);
+    let temp_path = temp_file.path().to_path_buf();
+    (|| {
+        let target = &target;
+        let temp_path = temp_path.clone();
+        let remote_script_path = remote_script_path.clone();
+        async move { copy_file(target, &temp_path, &remote_script_path).await }
+    })
+    .retry(ExponentialBuilder::default().with_max_times(5))
+    .sleep(tokio::time::sleep)
+    .notify(|err, dur| warn!("Retrying SCP transfer after {:?}: {:?}", dur, err))
+    .await?;
 
-    let scp_transfer = || async {
-        let output = tokio::time::timeout(
-            tokio::time::Duration::from_secs(60),
-            Command::new("sshpass")
-                .arg("-f")
-                .arg(&password_file_path)
-                .arg("scp")
-                .args(&ssh_options)
-                .arg(temp_file_path)
-                .arg(format!(
-                    "{}@{}:{}",
-                    username, ip_address, remote_script_path
-                ))
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output(),
+    // Execute. Detached: short launch timeout. Blocking: 10min.
+    let (timeout_secs, cmd) = if run_detached {
+        (
+            60u64,
+            format!(
+                "chmod +x {p} && nohup {p} > /tmp/script_stdout.log 2> /tmp/script_stderr.log & echo $!",
+                p = remote_script_path
+            ),
         )
-        .await
-        .map_err(|_| anyhow::anyhow!("SCP transfer timed out after 60s"))?
-        .map_err(|e| anyhow::anyhow!("SCP command error: {}", e))?;
-
-        if !output.status.success() {
-            Err(anyhow::anyhow!(
-                "SCP failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ))
-        } else {
-            Ok(())
-        }
+    } else {
+        (
+            600u64,
+            format!("chmod +x {p} && {p}", p = remote_script_path),
+        )
     };
+    let script_output = (|| {
+        let target = &target;
+        let cmd = cmd.clone();
+        async move { exec(target, &cmd, tokio::time::Duration::from_secs(timeout_secs)).await }
+    })
+    .retry(ExponentialBuilder::default().with_max_times(3))
+    .sleep(tokio::time::sleep)
+    .notify(|err, dur| warn!("Retrying script execution after {:?}: {:?}", dur, err))
+    .await?;
 
-    scp_transfer
-        .retry(ExponentialBuilder::default().with_max_times(5))
-        .sleep(tokio::time::sleep)
-        .when(|e| {
-            let msg = e.to_string();
-            msg.contains("SCP failed") || msg.contains("SCP transfer timed out")
-        })
-        .notify(|err, dur| warn!("Retrying SCP transfer after {:?}: {:?}", dur, err))
-        .await?;
+    // password_tmp drops here, auto-removing the file. No manual cleanup needed.
+    drop(password_tmp);
 
-    info!("✔ SCP transfer successful");
-
-    // Step 9: Execute the script on the VM with retries (capped at 3 retries, with timeout)
-    let execute_script = || async {
-        let (timeout_secs, cmd_future) = if run_detached {
-            info!("Executing script on VM in detached mode");
-            (
-                60u64,
-                Command::new("sshpass")
-                    .arg("-f").arg(&password_file_path)
-                    .arg("ssh")
-                    .args(&ssh_options)
-                    .arg(format!("{}@{}", username, ip_address))
-                    .arg(format!("chmod +x {} && nohup {} > /tmp/script_stdout.log 2> /tmp/script_stderr.log & echo $!",
-                                 remote_script_path, remote_script_path))
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .output(),
-            )
-        } else {
-            info!("Executing script on VM and waiting for completion");
-            (
-                600u64,
-                Command::new("sshpass")
-                    .arg("-f")
-                    .arg(&password_file_path)
-                    .arg("ssh")
-                    .args(&ssh_options)
-                    .arg(format!("{}@{}", username, ip_address))
-                    .arg(format!(
-                        "chmod +x {} && {}",
-                        remote_script_path, remote_script_path
-                    ))
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .output(),
-            )
-        };
-
-        let output =
-            tokio::time::timeout(tokio::time::Duration::from_secs(timeout_secs), cmd_future)
-                .await
-                .map_err(|_| anyhow::anyhow!("Script execution timed out after {}s", timeout_secs))?
-                .map_err(|e| anyhow::anyhow!("Script command error: {}", e))?;
-
-        if !output.status.success() {
-            Err(anyhow::anyhow!(
-                "Script execution failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ))
-        } else {
-            Ok(String::from_utf8_lossy(&output.stdout).to_string())
-        }
-    };
-
-    let script_output = execute_script
-        .retry(ExponentialBuilder::default().with_max_times(3))
-        .sleep(tokio::time::sleep)
-        .when(|e| {
-            let msg = e.to_string();
-            msg.contains("Script execution failed") || msg.contains("Script execution timed out")
-        })
-        .notify(|err, dur| warn!("Retrying script execution after {:?}: {:?}", dur, err))
-        .await?;
-
-    // Step 10: Clean up password file
-    clean_up_password_file(&password_file_path);
-
-    // Step 11: Return the output
     info!("Script execution completed successfully.");
     Ok(script_output)
 }
 
-// Helper function to create a temporary file containing the password
-fn create_password_file(password: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let temp_dir = std::env::temp_dir();
-    let password_file_path = temp_dir.join(format!(
-        "sshpass_{}.txt",
-        Instant::now().elapsed().as_millis()
-    ));
-
-    let mut file = File::create(&password_file_path)?;
-    file.write_all(password.as_bytes())?;
-
-    // Restrict permissions on the password file (important for security)
+/// Write the SSH password to a 0600 tempfile using `NamedTempFile` (O_EXCL +
+/// random suffix → not symlink-attackable, unlike the previous predictable
+/// `/tmp/sshpass_<millis>.txt`). Returns the `NamedTempFile` — keep it alive
+/// for the full SSH session; drop it to auto-delete. Permissions are tightened
+/// BEFORE the password is written to the file.
+fn create_password_file(password: &str) -> Result<NamedTempFile, Box<dyn std::error::Error>> {
+    let mut tmp = NamedTempFile::new()?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let metadata = file.metadata()?;
-        let mut permissions = metadata.permissions();
-        permissions.set_mode(0o600); // Owner read/write only
-        std::fs::set_permissions(&password_file_path, permissions)?;
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o600))?;
     }
-
-    Ok(password_file_path.to_string_lossy().to_string())
-}
-
-// Helper function to clean up the password file
-fn clean_up_password_file(file_path: &str) {
-    if let Err(e) = remove_file(file_path) {
-        error!("Failed to remove temporary password file: {}", e);
-    } else {
-        info!("Temporary password file removed");
-    }
+    tmp.write_all(password.as_bytes())?;
+    Ok(tmp)
 }
 
 async fn wait_for_vm_ip(

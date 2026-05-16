@@ -3,3 +3,10 @@
 # agent id
 .agent_id
 .aider*
+
+# secrets — local dev env, never commit
+.env
+.env.*
+*.token
+*.key
+*.pem

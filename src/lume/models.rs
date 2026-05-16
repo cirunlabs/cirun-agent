@@ -13,13 +13,13 @@ pub struct VmConfig {
     pub ipsw: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SharedDirectory {
     pub host_path: String,
     pub read_only: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "noDisplay")]

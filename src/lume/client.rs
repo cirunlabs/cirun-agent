@@ -10,6 +10,19 @@ const DEFAULT_API_URL: &str = "http://127.0.0.1:7777/lume";
 const CONNECT_TIMEOUT: u64 = 10; // 10 seconds
 const MAX_TIMEOUT: u64 = 300; // 5 minutes
 
+/// True when a non-2xx delete response means "the VM is already gone" rather
+/// than "the delete actually failed". Lume returns HTTP 400 with the body
+/// `{"message":"Virtual machine not found: <name>"}` in that case (observed
+/// in prod 2026-05-15). Treating it as success lets the agent honour a
+/// duplicate delete request from the cirun api without burning the retry
+/// budget — same shape as `docker rm`'s "No such container" path.
+pub(crate) fn lume_delete_means_absent(status: reqwest::StatusCode, body: &str) -> bool {
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return true;
+    }
+    body.contains("Virtual machine not found") || body.contains("VM not found")
+}
+
 pub struct LumeClient {
     client: Client,
     base_url: String,
@@ -64,34 +77,52 @@ impl LumeClient {
 
     pub async fn run_vm(&self, name: &str, config: Option<RunConfig>) -> Result<(), LumeError> {
         let url = format!("{}/vms/{}/run", self.base_url, name);
-
-        let mut request = self.client.post(&url);
-
-        if let Some(run_config) = config {
-            request = request.json(&run_config);
-        }
-
         info!("Sending request to start VM: {}", name);
 
-        let response = request.send().await?;
-        let status = response.status(); // Clone status before calling .text()
-        let response_text = response
-            .text()
+        // Lume's daemon transiently drops the connection right after a clone
+        // (observed on m1 2026-05-15: "Connection reset by peer" within 1s of
+        // clone returning 200). Wrap in the same retry shape as delete_vm so
+        // a single hiccup doesn't fail provisioning. Without this the new
+        // executor::lume::spawn → run_vm path is too brittle to land cleanly
+        // in production.
+        let send_run_request = || {
+            let url = url.clone();
+            let cfg = config.clone();
+            async move {
+                let mut request = self.client.post(&url);
+                if let Some(run_config) = cfg {
+                    request = request.json(&run_config);
+                }
+                let response = request
+                    .send()
+                    .await
+                    .map_err(|e| LumeError::ApiError(format!("HTTP request failed: {:?}", e)))?;
+                let status = response.status();
+                let response_text = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "Failed to read response body".to_string());
+                info!(
+                    "VM Run API Response: Status = {}, Body = {}",
+                    status, response_text
+                );
+                if !status.is_success() {
+                    return Err(LumeError::ApiError(format!(
+                        "Failed to run VM: {}",
+                        response_text
+                    )));
+                }
+                Ok(())
+            }
+        };
+
+        send_run_request
+            .retry(ExponentialBuilder::default().with_max_times(5))
+            .sleep(tokio::time::sleep)
+            .when(|e| matches!(e, LumeError::ApiError(_)))
+            .notify(|err, dur| warn!("Retrying VM start after {:?}: {:?}", dur, err))
             .await
-            .unwrap_or_else(|_| "Failed to read response body".to_string());
-
-        info!(
-            "VM Run API Response: Status = {}, Body = {}",
-            status, response_text
-        );
-
-        if !status.is_success() {
-            // Use the cloned status here
-            return Err(LumeError::ApiError(format!(
-                "Failed to run VM: {}",
-                response_text
-            )));
-        }
+            .map_err(|e| LumeError::ApiError(format!("Retry exhausted: {:?}", e)))?;
 
         info!("Successfully started VM: {}", name);
         Ok(())
@@ -168,6 +199,14 @@ impl LumeClient {
                 info!("Delete operation response body: {}", response_text);
 
                 if !status.is_success() {
+                    // Idempotent: "already gone" is success, not a retryable
+                    // failure. Without this short-circuit, a duplicate delete
+                    // from the cirun api burns the 5-attempt retry budget on
+                    // every cycle (observed in prod 2026-05-15).
+                    if lume_delete_means_absent(status, &response_text) {
+                        info!("VM {} already absent — treating delete as success", name);
+                        return Ok(());
+                    }
                     return Err(LumeError::ApiError(format!(
                         "Failed to delete VM: {}",
                         response_text
@@ -312,5 +351,42 @@ impl LumeClient {
 
         info!("Image pull request sent successfully for '{}'", image);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::StatusCode;
+
+    #[test]
+    fn classifier_treats_400_not_found_body_as_absent() {
+        let body = r#"{"message":"Virtual machine not found: cirun-r1"}"#;
+        assert!(lume_delete_means_absent(StatusCode::BAD_REQUEST, body));
+    }
+
+    #[test]
+    fn classifier_treats_http_404_as_absent_regardless_of_body() {
+        assert!(lume_delete_means_absent(StatusCode::NOT_FOUND, ""));
+    }
+
+    #[test]
+    fn classifier_rejects_500_and_other_failures() {
+        assert!(!lume_delete_means_absent(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "boom"
+        ));
+        assert!(!lume_delete_means_absent(
+            StatusCode::CONFLICT,
+            "vm is locked"
+        ));
+    }
+
+    #[test]
+    fn classifier_does_not_match_unrelated_400() {
+        assert!(!lume_delete_means_absent(
+            StatusCode::BAD_REQUEST,
+            "invalid name format"
+        ));
     }
 }

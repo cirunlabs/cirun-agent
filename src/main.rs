@@ -1,31 +1,38 @@
+mod api;
+mod bootstrap;
+mod cirun_client;
+mod config;
+mod docker;
+mod executor;
+#[cfg(target_os = "macos")]
 mod lume;
+#[cfg(target_os = "linux")]
 mod meda;
+mod provision;
+mod service;
+mod ssh;
+#[cfg(target_os = "macos")]
 mod vm_provision;
 
-use crate::lume::client::LumeClient;
+// TemplateConfig is only consumed by the macos lume template-name test below.
+#[cfg(all(test, target_os = "macos"))]
+use api::TemplateConfig;
+
+use crate::cirun_client::CirunClient;
+#[cfg(target_os = "macos")]
 use crate::lume::setup::cleanup_log_files as cleanup_lume_logs;
-use crate::lume::{
-    check_template_exists, create_template, find_matching_template, generate_template_name,
-};
-use crate::meda::client::MedaClient;
+#[cfg(target_os = "linux")]
 use crate::meda::setup::cleanup_log_files as cleanup_meda_logs;
+use crate::provision::ProvisionResult;
+#[cfg(target_os = "macos")]
 use crate::vm_provision::run_script_on_vm;
 use clap::Parser;
 use log::{debug, error, info, warn};
-use reqwest::{Client, Error};
-use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::collections::HashMap;
 use std::env;
-use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command as StdCommand;
-use std::sync::Arc;
 use std::time::SystemTime;
-use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::{sleep, Duration};
-use uuid::Uuid;
 
 const CIRUN_BANNER: &str = r#"
        _                       _                    _
@@ -41,7 +48,11 @@ const CIRUN_BANNER: &str = r#"
 #[command(version, about = "Cirun Agent", long_about = None)]
 struct Args {
     /// API token for authentication
-    #[arg(short, long, required_unless_present = "uninstall_service")]
+    #[arg(
+        short,
+        long,
+        required_unless_present_any = ["uninstall_service", "docker_smoke_test"],
+    )]
     api_token: Option<String>,
 
     /// Polling interval in seconds
@@ -67,1471 +78,60 @@ struct Args {
     /// Maximum number of concurrent VMs (required on macOS due to Apple Virtualization Framework limit of 2)
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
     max_vms: Option<u32>,
+
+    /// Run a docker GPU smoke test (`docker run --rm --gpus all <image> nvidia-smi`) and exit.
+    /// Use to verify nvidia-container-toolkit + GPU passthrough on the host.
+    #[arg(long)]
+    docker_smoke_test: bool,
+
+    /// Image to use for `--docker-smoke-test` (default: `nvidia/cuda:12.4.0-base-ubuntu22.04`).
+    #[arg(long, default_value = "nvidia/cuda:12.4.0-base-ubuntu22.04")]
+    docker_smoke_image: String,
 }
 
 const MACOS_DEFAULT_MAX_VMS: u32 = 2;
 
-// Structs for agent and API data
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct AgentInfo {
-    id: String,
-    hostname: String,
-    os: String,
-    arch: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ApiResponse {
-    #[serde(default)]
-    runners_to_provision: Vec<RunnerToProvision>,
-    runners_to_delete: Vec<RunnerToDelete>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct TemplateConfig {
-    image: String,
-    registry: Option<String>,
-    organization: Option<String>,
-    cpu: u32,
-    memory: u32,
-    disk: u32,
-    os: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct RunnerLogin {
-    username: String,
-    password: String,
-}
-
-#[derive(Debug, Clone)]
-struct RunnerResources {
-    cpu: u32,
-    memory: u32,
-    disk: u32,
-}
-
-fn default_max_retries() -> u32 {
-    3
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct RunnerToProvision {
-    name: String,
-    provision_script: String,
-    image: String, // The container/VM image to use
-    os: String,    // The OS platform: "linux", "macos", or "windows"
-    cpu: u32,
-    memory: u32,
-    #[serde(default)]
-    disk: u32,
-    login: RunnerLogin,
-    #[serde(default = "default_max_retries")]
-    max_retries: u32,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct RunnerToDelete {
-    name: String,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Serialize, Deserialize)]
-struct CommandResponse {
-    command: String,
-    output: String,
-    error: String,
-    agent: AgentInfo,
-}
-
-// Helper function to determine if we should use meda (Linux host) or lume (macOS host)
-fn use_meda() -> bool {
-    env::consts::OS == "linux"
-}
-
-/// Get the count of currently running VMs
-async fn get_running_vm_count() -> Result<usize, Box<dyn std::error::Error>> {
-    if use_meda() {
-        let meda = MedaClient::new()?;
-        let vms = meda.list_vms().await?;
-        Ok(vms.iter().filter(|vm| vm.state == "running").count())
-    } else {
-        let lume = LumeClient::new()?;
-        let vms = lume.list_vms().await?;
-        Ok(vms.iter().filter(|vm| vm.state == "running").count())
-    }
-}
-
-/// Result of a single runner provisioning attempt
-struct ProvisionResult {
-    runner_name: String,
-    outcome: Result<(), String>,
-}
-
-/// Provision a single runner in its own task (standalone, no &self needed).
-/// Acquires a semaphore permit to enforce concurrency bounds.
-async fn provision_single_runner(
-    runner: RunnerToProvision,
-    semaphore: Arc<Semaphore>,
-) -> ProvisionResult {
-    let _permit = semaphore.acquire().await.expect("semaphore closed");
-
-    info!(
-        "Processing runner: {} (image: {}, os: {}, cpu: {}, mem: {}GB, disk: {}GB)",
-        runner.name, runner.image, runner.os, runner.cpu, runner.memory, runner.disk
-    );
-
-    // Parse registry from image name
-    let (registry, image) =
-        if runner.image.contains('.') && runner.image.split('/').next().unwrap().contains('.') {
-            let parts: Vec<&str> = runner.image.splitn(2, '/').collect();
-            if parts.len() == 2 {
-                (Some(parts[0].to_string()), parts[1].to_string())
-            } else {
-                (Some("ghcr.io".to_string()), runner.image.clone())
-            }
-        } else {
-            (Some("ghcr.io".to_string()), runner.image.clone())
-        };
-
-    let template_config = TemplateConfig {
-        image,
-        registry,
-        organization: None,
-        cpu: runner.cpu,
-        memory: runner.memory,
-        disk: runner.disk,
-        os: runner.os.clone(),
-    };
-
-    // Resolve template: meda uses image directly, lume uses template matching
-    let template_name = if use_meda() {
-        info!(
-            "Using meda on Linux - using image name directly: {}",
-            runner.image
-        );
-        Some(runner.image.clone())
-    } else if let Some(existing_template) = find_matching_template(&template_config).await {
-        info!(
-            "Found existing template with matching configuration: {}",
-            existing_template
-        );
-        Some(existing_template)
-    } else {
-        let generated_name = generate_template_name(&template_config);
-        let template_exists = check_template_exists(&generated_name).await;
-
-        if !template_exists {
-            info!(
-                "No matching template found. Creating new template '{}' from image '{}'",
-                generated_name, template_config.image
-            );
-            match create_template(&template_config, &generated_name).await {
-                Ok(_) => {
-                    info!("Successfully created template: {}", generated_name);
-                    Some(generated_name)
-                }
-                Err(e) => {
-                    error!("Failed to create template {}: {}", generated_name, e);
-                    return ProvisionResult {
-                        runner_name: runner.name.clone(),
-                        outcome: Err(format!("Template creation failed: {}", e)),
-                    };
-                }
-            }
-        } else {
-            info!("Using existing template: {}", generated_name);
-            Some(generated_name)
-        }
-    };
-
-    let template_name = match template_name {
-        Some(t) => t,
-        None => {
-            return ProvisionResult {
-                runner_name: runner.name.clone(),
-                outcome: Err("No template available".to_string()),
-            };
-        }
-    };
-
-    info!(
-        "Provisioning runner '{}' with template '{}'",
-        runner.name, template_name
-    );
-
-    let resources = RunnerResources {
-        cpu: runner.cpu,
-        memory: runner.memory,
-        disk: runner.disk,
-    };
-
-    // Dispatch to meda or lume provisioning
-    let result = if use_meda() {
-        do_provision_meda(
-            &runner.name,
-            &runner.provision_script,
-            &template_name,
-            &runner.login,
-            &resources,
-        )
-        .await
-    } else {
-        do_provision_lume(
-            &runner.name,
-            &runner.provision_script,
-            &template_name,
-            &runner.login,
-        )
-        .await
-    };
-
-    match result {
-        Ok(()) => {
-            info!(
-                "Successfully provisioned runner: {} using template {}",
-                runner.name, template_name
-            );
-            ProvisionResult {
-                runner_name: runner.name.clone(),
-                outcome: Ok(()),
-            }
-        }
-        Err(e) => {
-            let error_msg = e.to_string();
-            error!(
-                "Failed to provision runner {} using template {}: {}",
-                runner.name, template_name, error_msg
-            );
-            ProvisionResult {
-                runner_name: runner.name.clone(),
-                outcome: Err(error_msg),
-            }
-        }
-    }
-}
-
-/// Free-function version of meda provisioning (no &self needed)
-async fn do_provision_meda(
-    runner_name: &str,
-    provision_script: &str,
-    image: &str,
-    runner_login: &RunnerLogin,
-    resources: &RunnerResources,
-) -> Result<(), String> {
-    use crate::meda::models::VmRunRequest;
-
-    let meda = MedaClient::new().map_err(|e| format!("Failed to initialize Meda client: {e}"))?;
-
-    match meda.get_vm(runner_name).await {
-        Ok(vm_info) => {
-            if vm_info.state == "running" {
-                info!(
-                    "VM '{}' already exists and is running. Skipping creation.",
-                    runner_name
-                );
-            } else {
-                info!(
-                    "VM '{}' exists but is not running. Starting it...",
-                    runner_name
-                );
-                meda.start_vm(runner_name)
-                    .await
-                    .map_err(|e| format!("Failed to start VM '{}': {e}", runner_name))?;
-            }
-        }
-        Err(_) => {
-            info!(
-                "VM '{}' does not exist. Creating from image '{}'...",
-                runner_name, image
-            );
-            let run_request = VmRunRequest {
-                image: image.to_string(),
-                name: Some(runner_name.to_string()),
-                memory: Some(format!("{}G", resources.memory)),
-                cpus: Some(resources.cpu),
-                disk_size: Some(format!("{}G", resources.disk)),
-            };
-
-            if let Err(err_msg) = meda.run_vm(run_request).await.map_err(|e| {
-                format!(
-                    "Failed to create and run VM from image '{}': {:?}",
-                    image, e
-                )
-            }) {
-                error!("{}", err_msg);
-                let _ = CirunClient::cleanup_failed_runner(runner_name).await;
-                return Err(err_msg);
-            }
-            info!("VM '{}' created and started successfully", runner_name);
-        }
-    }
-
-    info!("Waiting for VM '{}' to get an IP address...", runner_name);
-    let ip_address = match meda
-        .wait_for_vm_ip(runner_name, 300)
-        .await
-        .map_err(|e| format!("Failed to get VM IP address: {:?}", e))
-    {
-        Ok(ip) => ip,
-        Err(err_msg) => {
-            error!("{}", err_msg);
-            let _ = CirunClient::cleanup_failed_runner(runner_name).await;
-            return Err(err_msg);
-        }
-    };
-
-    info!("VM '{}' has IP address: {}", runner_name, ip_address);
-    info!("Provisioning runner: {}", runner_name);
-
-    match run_script_on_vm_meda(
-        &meda,
-        runner_name,
-        &ip_address,
-        provision_script,
-        runner_login,
-        true,
-    )
-    .await
-    .map_err(|e| format!("Failed to provision runner: {}", e))
-    {
-        Ok(output) => {
-            info!("Runner provisioning completed successfully");
-            info!("Script output: {}", output);
-            Ok(())
-        }
-        Err(err_msg) => {
-            error!("{}", err_msg);
-            let _ = CirunClient::cleanup_failed_runner(runner_name).await;
-            Err(err_msg)
-        }
-    }
-}
-
-/// Free-function version of lume provisioning (no &self needed)
-async fn do_provision_lume(
-    runner_name: &str,
-    provision_script: &str,
-    template_name: &str,
-    runner_login: &RunnerLogin,
-) -> Result<(), String> {
-    let lume = LumeClient::new().map_err(|e| format!("Failed to initialize Lume client: {e}"))?;
-
-    let vm_result = lume.get_vm(runner_name).await;
-    let vm_exists = vm_result.is_ok();
-
-    let vm = if vm_exists {
-        vm_result.unwrap()
-    } else {
-        info!(
-            "VM '{}' does not exist. Attempting to clone from template '{}'...",
-            runner_name, template_name
-        );
-
-        let template_check = lume.get_vm(template_name).await.map_err(|e| {
-            format!(
-                "Template '{}' not found: {:?}. Cannot provision runner.",
-                template_name, e
-            )
-        });
-        template_check?;
-
-        let clone_result = lume
-            .clone_vm(template_name, runner_name)
-            .await
-            .map_err(|e| {
-                format!(
-                    "Failed to clone VM from template '{}': {:?}",
-                    template_name, e
-                )
-            });
-        match clone_result {
-            Ok(_) => {
-                info!(
-                    "VM '{}' cloned successfully from template '{}'",
-                    runner_name, template_name
-                );
-                lume.get_vm(runner_name)
-                    .await
-                    .map_err(|e| format!("Failed to get VM after clone: {:?}", e))?
-            }
-            Err(err_msg) => {
-                error!("{}", err_msg);
-                let _ = CirunClient::cleanup_failed_runner(runner_name).await;
-                return Err(err_msg);
-            }
-        }
-    };
-
-    info!("VM '{}' is now available", runner_name);
-
-    if vm.state != "stopped" {
-        info!(
-            "VM '{}' exists and is not stopped. Skipping provisioning.",
-            runner_name
-        );
-        return Ok(());
-    }
-
-    let username = runner_login.username.clone();
-    let password = runner_login.password.clone();
-
-    info!("Provisioning runner: {}", runner_name);
-
-    match run_script_on_vm(
-        &lume,
-        runner_name,
-        provision_script,
-        &username,
-        &password,
-        20,
-        true,
-    )
-    .await
-    .map_err(|e| format!("Failed to provision runner: {}", e))
-    {
-        Ok(output) => {
-            info!("Runner provisioning completed successfully");
-            info!("Script output: {}", output);
-            Ok(())
-        }
-        Err(err_msg) => {
-            error!("{}", err_msg);
-            let _ = CirunClient::cleanup_failed_runner(runner_name).await;
-            Err(err_msg)
-        }
-    }
-}
-
-// Get system hostname
-fn get_hostname() -> String {
-    if let Ok(hostname) = env::var("HOSTNAME") {
-        return hostname;
-    }
-
-    if let Ok(output) = StdCommand::new("hostname").output() {
-        if let Ok(hostname) = String::from_utf8(output.stdout) {
-            return hostname.trim().to_string();
-        }
-    }
-
-    "unknown-host".to_string()
-}
-
-// Generate or retrieve a persistent agent information
-fn check_sshpass_installed() -> bool {
-    match StdCommand::new("which").arg("sshpass").output() {
-        Ok(output) => {
-            if output.status.success() {
-                info!("✅ sshpass is installed");
-                true
-            } else {
-                error!("❌ sshpass is not installed");
-                error!("VM provisioning requires sshpass for SSH authentication");
-                error!("Install it using: brew install sshpass");
-                false
-            }
-        }
-        Err(e) => {
-            warn!("Failed to check for sshpass: {}", e);
-            false
-        }
-    }
-}
-
-fn get_agent_info(id_file: &str) -> AgentInfo {
-    let id = if Path::new(id_file).exists() {
-        match fs::read_to_string(id_file) {
-            Ok(id) => {
-                let id = id.trim().to_string();
-                info!("Using existing agent ID: {}", id);
-                id
-            }
-            Err(e) => {
-                error!("Failed to read agent ID file: {}", e);
-                // Generate a new UUID v4
-                let new_id = Uuid::new_v4().to_string();
-                info!("Generated new agent ID: {}", new_id);
-
-                // Save the ID to file for persistence
-                if let Err(e) = fs::write(id_file, &new_id) {
-                    error!("Failed to write agent ID to file: {}", e);
-                }
-
-                new_id
-            }
-        }
-    } else {
-        // Generate a new UUID v4
-        let new_id = Uuid::new_v4().to_string();
-        info!("Generated new agent ID: {}", new_id);
-
-        // Save the ID to file for persistence
-        if let Err(e) = fs::write(id_file, &new_id) {
-            error!("Failed to write agent ID to file: {}", e);
-        }
-
-        new_id
-    };
-
-    AgentInfo {
-        id,
-        hostname: get_hostname(),
-        os: env::consts::OS.to_string(),
-        arch: env::consts::ARCH.to_string(),
-    }
-}
-
-// Client for interacting with the CiRun API
-struct CirunClient {
-    client: Client,
-    base_url: String,
-    api_token: String,
-    agent: AgentInfo,
-    retry_tracker: HashMap<String, u32>,
-    /// None means no limit, Some(n) means max n concurrent VMs
-    max_vms: Option<u32>,
-}
-
-impl CirunClient {
-    fn new(base_url: &str, api_token: &str, agent: AgentInfo, max_vms: Option<u32>) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(15))
-            .connect_timeout(Duration::from_secs(10))
-            .build()
-            .expect("Failed to build HTTP client");
-
-        CirunClient {
-            client,
-            base_url: base_url.to_string(),
-            api_token: api_token.to_string(),
-            agent,
-            retry_tracker: HashMap::new(),
-            max_vms,
-        }
-    }
-
-    // Helper method to create a request builder with common headers
-    fn create_request(&self, method: reqwest::Method, url: &str) -> reqwest::RequestBuilder {
-        let request_id = Uuid::new_v4().to_string();
-        info!("Creating request with ID: {}", request_id);
-
-        self.client
-            .request(method, url)
-            .header("Authorization", format!("Bearer {}", self.api_token))
-            .header("X-Request-ID", request_id)
-            .header("X-Agent-ID", &self.agent.id)
-    }
-
-    async fn handle_orphaned_runners(&self, response: reqwest::Response) {
-        // Parse response for runners_to_delete (orphaned VMs)
-        match response.json::<ApiResponse>().await {
-            Ok(api_response) => {
-                if !api_response.runners_to_delete.is_empty() {
-                    info!(
-                        "API returned {} orphaned runners to delete from POST",
-                        api_response.runners_to_delete.len()
-                    );
-                    for runner in &api_response.runners_to_delete {
-                        match self.delete_runner(&runner.name).await {
-                            Ok(_) => {
-                                info!("✅ Successfully deleted orphaned runner: {}", runner.name);
-                            }
-                            Err(e) => {
-                                error!("❌ Failed to delete orphaned runner {}: {}", runner.name, e)
-                            }
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                info!(
-                    "No runners_to_delete in POST response or parse error: {}",
-                    e
-                );
-            }
-        }
-    }
-
-    async fn report_running_vms(&self) {
-        info!("Reporting running VMs to API");
-
-        if use_meda() {
-            // Use meda for Linux
-            // Check if meda is running, restart if needed
-            if !meda::setup::is_meda_running() {
-                warn!("Meda process is not running. Restarting...");
-                meda::download_and_run_meda().await;
-            }
-
-            match MedaClient::new() {
-                Ok(meda) => {
-                    match meda.list_vms().await {
-                        Ok(vms) => {
-                            // Report all cirun VMs (running or stopped) so API can sync deletion state
-                            let cirun_vms: Vec<_> = vms
-                                .into_iter()
-                                .filter(|vm| vm.name.starts_with("cirun-"))
-                                .collect();
-                            let url = format!("{}/agent", self.base_url);
-
-                            let res = self
-                                .create_request(reqwest::Method::POST, &url)
-                                .json(&json!({
-                                    "agent": self.agent,
-                                    "vms": cirun_vms.iter().map(|vm| {
-                                        json!({
-                                            "name": vm.name,
-                                            "os": "linux",
-                                            "cpu": vm.cpus.unwrap_or(2),
-                                            "memory": vm.memory.as_ref().and_then(|m| m.trim_end_matches("GB").trim_end_matches("G").parse::<u64>().ok()).unwrap_or(2048),
-                                            "disk_size": 0  // Meda doesn't report disk size in list
-                                        })
-                                    }).collect::<Vec<_>>()
-                                }))
-                                .send()
-                                .await;
-
-                            match res {
-                                Ok(response) => {
-                                    let status = response.status();
-                                    info!("API response status: {}", status);
-                                    if let Some(req_id) = response.headers().get("X-Request-ID") {
-                                        if let Ok(id) = req_id.to_str() {
-                                            info!("Response received with request ID: {}", id);
-                                        }
-                                    }
-                                    self.handle_orphaned_runners(response).await;
-                                }
-                                Err(e) => error!("Failed to send running VMs: {}", e),
-                            }
-                        }
-                        Err(e) => error!("Failed to list VMs: {:?}", e),
-                    }
-                }
-                Err(e) => error!("Failed to initialize Meda client: {:?}", e),
-            }
-        } else {
-            // Use lume for macOS
-            // Check if lume is running, restart if needed
-            if !lume::setup::is_lume_running() {
-                warn!("Lume process is not running. Restarting...");
-                lume::download_and_run_lume().await;
-            }
-
-            match LumeClient::new() {
-                Ok(lume) => {
-                    match lume.list_vms().await {
-                        Ok(vms) => {
-                            // Report all cirun VMs (running or stopped) so API can sync deletion state
-                            let cirun_vms: Vec<_> = vms
-                                .into_iter()
-                                .filter(|vm| vm.name.starts_with("cirun-"))
-                                .collect();
-                            let url = format!("{}/agent", self.base_url);
-
-                            // Use the helper method instead of direct client access
-                            let res = self
-                                .create_request(reqwest::Method::POST, &url)
-                                .json(&json!({
-                                    "agent": self.agent,
-                                    "vms": cirun_vms.iter().map(|vm| {
-                                        json!({
-                                            "name": vm.name,
-                                            "os": vm.os,
-                                            "cpu": vm.cpu,
-                                            "memory": vm.memory,
-                                            "disk_size": vm.disk_size.total
-                                        })
-                                    }).collect::<Vec<_>>()
-                                }))
-                                .send()
-                                .await;
-
-                            match res {
-                                Ok(response) => {
-                                    let status = response.status();
-                                    info!("API response status: {}", status);
-                                    if let Some(req_id) = response.headers().get("X-Request-ID") {
-                                        if let Ok(id) = req_id.to_str() {
-                                            info!("Response received with request ID: {}", id);
-                                        }
-                                    }
-                                    self.handle_orphaned_runners(response).await;
-                                }
-                                Err(e) => error!("Failed to send running VMs: {}", e),
-                            }
-                        }
-                        Err(e) => error!("Failed to list VMs: {:?}", e),
-                    }
-                }
-                Err(e) => error!("Failed to initialize Lume client: {:?}", e),
-            }
-        }
-    }
-
-    /// Helper function to cleanup a failed runner VM
-    async fn cleanup_failed_runner(runner_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-        info!("Cleaning up failed runner: {}", runner_name);
-
-        if use_meda() {
-            match MedaClient::new() {
-                Ok(meda) => match meda.delete_vm(runner_name).await {
-                    Ok(_) => {
-                        info!("Successfully deleted failed runner VM: {}", runner_name);
-                        Ok(())
-                    }
-                    Err(e) => {
-                        error!("Failed to delete runner VM {}: {:?}", runner_name, e);
-                        Err(e.into())
-                    }
-                },
-                Err(e) => {
-                    error!("Failed to initialize Meda client for cleanup: {:?}", e);
-                    Err(e.into())
-                }
-            }
-        } else {
-            match LumeClient::new() {
-                Ok(lume) => match lume.delete_vm(runner_name).await {
-                    Ok(_) => {
-                        info!("Successfully deleted failed runner VM: {}", runner_name);
-                        Ok(())
-                    }
-                    Err(e) => {
-                        error!("Failed to delete runner VM {}: {:?}", runner_name, e);
-                        Err(e.into())
-                    }
-                },
-                Err(e) => {
-                    error!("Failed to initialize Lume client for cleanup: {:?}", e);
-                    Err(e.into())
-                }
-            }
-        }
-    }
-
-    async fn delete_runner(&self, runner_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-        if use_meda() {
-            match MedaClient::new() {
-                Ok(meda) => {
-                    info!("Attempting to delete runner VM: {}", runner_name);
-                    match meda.get_vm(runner_name).await {
-                        Ok(_) => match meda.delete_vm(runner_name).await {
-                            Ok(_) => {
-                                info!("Successfully deleted runner VM: {}", runner_name);
-                                Ok(())
-                            }
-                            Err(e) => {
-                                error!("Failed to delete runner VM {}: {:?}", runner_name, e);
-                                Err(format!("Failed to delete VM: {:?}", e).into())
-                            }
-                        },
-                        Err(e) => {
-                            warn!(
-                                "VM '{}' not found or error retrieving VM details: {:?}",
-                                runner_name, e
-                            );
-                            info!("VM '{}' doesn't exist or can't be accessed - considering delete successful", runner_name);
-                            Ok(())
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to initialize Meda client: {:?}", e);
-                    Err(e.into())
-                }
-            }
-        } else {
-            match LumeClient::new() {
-                Ok(lume) => {
-                    info!("Attempting to delete runner VM: {}", runner_name);
-
-                    // Check if VM exists by trying to get its details
-                    match lume.get_vm(runner_name).await {
-                        Ok(vm) => {
-                            info!("Found VM '{}' with status: {}", runner_name, vm.state);
-
-                            // Delete the VM
-                            match lume.delete_vm(runner_name).await {
-                                Ok(_) => {
-                                    info!("VM '{}' deleted successfully", runner_name);
-                                    Ok(())
-                                }
-                                Err(e) => {
-                                    error!("Failed to delete VM '{}': {:?}", runner_name, e);
-                                    Err(format!("Failed to delete VM '{}': {:?}", runner_name, e)
-                                        .into())
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!(
-                                "VM '{}' not found or error retrieving VM details: {:?}",
-                                runner_name, e
-                            );
-                            // Consider this a success since the VM doesn't exist anyway
-                            info!("VM '{}' doesn't exist or can't be accessed - considering delete successful", runner_name);
-                            Ok(())
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to initialize Lume client: {:?}", e);
-                    Err(e.into())
-                }
-            }
-        }
-    }
-
-    /// Get the current retry count for a runner
-    fn get_retry_count(&self, runner_name: &str) -> u32 {
-        *self.retry_tracker.get(runner_name).unwrap_or(&0)
-    }
-
-    /// Increment the retry count for a runner and return the new count
-    fn increment_retry(&mut self, runner_name: &str) -> u32 {
-        let count = self
-            .retry_tracker
-            .entry(runner_name.to_string())
-            .or_insert(0);
-        *count += 1;
-        *count
-    }
-
-    /// Clear the retry count for a runner
-    fn clear_retry(&mut self, runner_name: &str) {
-        self.retry_tracker.remove(runner_name);
-    }
-
-    /// Check if a runner should be retried based on max_retries
-    fn should_retry(&self, runner_name: &str, max_retries: u32) -> bool {
-        self.get_retry_count(runner_name) < max_retries
-    }
-
-    /// Notify the API that a runner provisioning attempt failed
-    async fn notify_provision_failure(&self, runner_name: &str, error: String, attempt: u32) {
-        let url = format!("{}/agent", self.base_url);
-
-        info!(
-            "Notifying API of provisioning failure for {} (attempt {})",
-            runner_name, attempt
-        );
-
-        let request_data = json!({
-            "agent": self.agent,
-            "provision_failure": {
-                "runner_name": runner_name,
-                "error": error,
-                "attempt": attempt,
-            }
-        });
-
-        match self
-            .create_request(reqwest::Method::POST, &url)
-            .json(&request_data)
-            .send()
-            .await
-        {
-            Ok(response) => {
-                if response.status().is_success() {
-                    debug!("Successfully notified API of provisioning failure");
-                } else {
-                    warn!(
-                        "API returned non-success status for failure notification: {}",
-                        response.status()
-                    );
-                }
-            }
-            Err(e) => {
-                warn!("Failed to notify API of provisioning failure: {}", e);
-            }
-        }
-    }
-
-    async fn manage_runner_lifecycle(
-        &mut self,
-        provision_set: &mut JoinSet<ProvisionResult>,
-        in_flight: &mut std::collections::HashSet<String>,
-    ) -> Result<ApiResponse, Error> {
-        let url = format!("{}/agent", self.base_url);
-        info!("Fetching runner provision/deletion data from: {}", url);
-
-        let request_data = json!({
-            "agent": self.agent,
-        });
-
-        // Use the helper method instead of direct client access
-        let response = self
-            .create_request(reqwest::Method::GET, &url)
-            .json(&request_data)
-            .send()
-            .await?;
-
-        info!("Response status: {}", response.status());
-        let json: ApiResponse = response.json().await?;
-
-        // Handle any runners that need deletion
-        if !json.runners_to_delete.is_empty() {
-            info!(
-                "Received {} runners to delete",
-                json.runners_to_delete.len()
-            );
-
-            for runner in &json.runners_to_delete {
-                match self.delete_runner(&runner.name).await {
-                    Ok(_) => {
-                        info!("✅ Successfully deleted runner: {}", runner.name);
-                        self.report_running_vms().await;
-                    }
-
-                    Err(e) => error!("❌ Failed to delete runner {}: {}", runner.name, e),
-                }
-            }
-        }
-
-        // Handle runners that need provisioning
-        if !json.runners_to_provision.is_empty() {
-            info!(
-                "Received {} runners to provision",
-                json.runners_to_provision.len()
-            );
-
-            // First, handle retry-exhausted runners (notify API, skip them)
-            for runner in &json.runners_to_provision {
-                let current_attempts = self.get_retry_count(&runner.name);
-                if !self.should_retry(&runner.name, runner.max_retries) {
-                    warn!(
-                        "Runner '{}' has exceeded max retries ({}/{}). Skipping provisioning.",
-                        runner.name, current_attempts, runner.max_retries
-                    );
-                    self.notify_provision_failure(
-                        &runner.name,
-                        format!("Exceeded max retries ({})", runner.max_retries),
-                        current_attempts,
-                    )
-                    .await;
-                }
-            }
-
-            // Collect eligible runners (not retry-exhausted, not already in-flight)
-            let eligible_runners: Vec<RunnerToProvision> = json
-                .runners_to_provision
-                .iter()
-                .filter(|r| self.should_retry(&r.name, r.max_retries))
-                .filter(|r| {
-                    if in_flight.contains(&r.name) {
-                        info!("Skipping runner '{}' — already in-flight", r.name);
-                        false
-                    } else {
-                        true
-                    }
-                })
-                .cloned()
-                .collect();
-
-            if !eligible_runners.is_empty() {
-                // Calculate available slots based on VM capacity
-                let available_slots = if let Some(max_vms) = self.max_vms {
-                    match get_running_vm_count().await {
-                        Ok(running_count) => {
-                            let slots = (max_vms as usize).saturating_sub(running_count);
-                            info!(
-                                "VM capacity: {}/{} running, {} slots available, {} runners requested",
-                                running_count, max_vms, slots, eligible_runners.len()
-                            );
-                            if slots == 0 {
-                                info!("No VM slots available. Runners will be picked up on next poll.");
-                            }
-                            slots
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Failed to check VM capacity: {}. Using runner count as limit.",
-                                e
-                            );
-                            eligible_runners.len()
-                        }
-                    }
-                } else {
-                    eligible_runners.len()
-                };
-
-                if available_slots > 0 {
-                    // Cap runners to available slots
-                    let runners_to_spawn: Vec<RunnerToProvision> =
-                        eligible_runners.into_iter().take(available_slots).collect();
-
-                    info!(
-                        "Spawning {} runners in parallel (max concurrency: {})",
-                        runners_to_spawn.len(),
-                        available_slots
-                    );
-
-                    let semaphore = Arc::new(Semaphore::new(available_slots));
-
-                    for runner in runners_to_spawn {
-                        in_flight.insert(runner.name.clone());
-                        let sem = semaphore.clone();
-                        provision_set.spawn(provision_single_runner(runner, sem));
-                    }
-
-                    info!(
-                        "Spawned provisioning tasks. Total in-flight: {}",
-                        provision_set.len()
-                    );
-                }
-            }
-        }
-
-        Ok(json)
-    }
-}
-
-fn install_service(args: &Args) {
-    use std::fs;
-
-    println!("Installing cirun-agent as a system service...");
-
-    // Get the current executable path
-    let exe_path = std::env::current_exe().expect("Failed to get current executable path");
-    let exe_path_str = exe_path.to_str().expect("Failed to convert path to string");
-
-    // Build the command line
-    let api_token = args
-        .api_token
-        .as_ref()
-        .expect("API token is required for service installation");
-    let mut cmd = format!("{} --api-token {}", exe_path_str, api_token);
-    if args.interval != 5 {
-        cmd.push_str(&format!(" --interval {}", args.interval));
-    }
-    if args.verbose {
-        cmd.push_str(" --verbose");
-    }
-
-    if cfg!(target_os = "linux") {
-        // Check if service already exists and stop it first
-        let service_path = "/etc/systemd/system/cirun-agent.service";
-        if std::path::Path::new(service_path).exists() {
-            println!("Found existing cirun-agent service, stopping it...");
-            let _ = std::process::Command::new("systemctl")
-                .args(["stop", "cirun-agent"])
-                .status();
-            let _ = std::process::Command::new("systemctl")
-                .args(["disable", "cirun-agent"])
-                .status();
-        }
-
-        // Create systemd service file
-        // Get the home directory for the service
-        let home_dir = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-
-        let service_content = format!(
-            r#"[Unit]
-Description=Cirun Agent for On-Prem Runner Management
-After=network.target
-
-[Service]
-Type=simple
-ExecStart={}
-Environment="HOME={}"
-Restart=always
-RestartSec=10
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-"#,
-            cmd, home_dir
-        );
-
-        let service_path = "/etc/systemd/system/cirun-agent.service";
-        fs::write(service_path, service_content).expect("Failed to write systemd service file");
-        println!("✅ Created systemd service file at {}", service_path);
-
-        // Reload systemd and enable service
-        std::process::Command::new("systemctl")
-            .args(["daemon-reload"])
-            .status()
-            .expect("Failed to reload systemd");
-        println!("✅ Reloaded systemd");
-
-        std::process::Command::new("systemctl")
-            .args(["enable", "cirun-agent"])
-            .status()
-            .expect("Failed to enable cirun-agent service");
-        println!("✅ Enabled cirun-agent to start on boot");
-
-        std::process::Command::new("systemctl")
-            .args(["start", "cirun-agent"])
-            .status()
-            .expect("Failed to start cirun-agent service");
-        println!("✅ Started cirun-agent service");
-
-        println!("\nService installed successfully!");
-        println!("View logs: journalctl -u cirun-agent -f");
-        println!("Stop service: sudo systemctl stop cirun-agent");
-        println!("Restart service: sudo systemctl restart cirun-agent");
-    } else if cfg!(target_os = "macos") {
-        // Create launchd plist
-        let home_dir = std::env::var("HOME").expect("Failed to get HOME directory");
-        let plist_dir = format!("{}/Library/LaunchAgents", home_dir);
-        let plist_path = format!("{}/io.cirun.agent.plist", plist_dir);
-
-        // Check if service already exists and unload it first
-        if std::path::Path::new(&plist_path).exists() {
-            println!("Found existing cirun-agent service, unloading it...");
-            let _ = std::process::Command::new("launchctl")
-                .args(["unload", &plist_path])
-                .status();
-        }
-
-        fs::create_dir_all(&plist_dir).expect("Failed to create LaunchAgents directory");
-
-        let plist_content = format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>io.cirun.agent</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{}</string>
-        <string>--api-token</string>
-        <string>{}</string>
-        <string>--interval</string>
-        <string>{}</string>
-{}    </array>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-    </dict>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>{}/Library/Logs/cirun-agent.log</string>
-    <key>StandardErrorPath</key>
-    <string>{}/Library/Logs/cirun-agent.error.log</string>
-</dict>
-</plist>
-"#,
-            exe_path_str,
-            api_token,
-            args.interval,
-            if args.verbose {
-                "        <string>--verbose</string>\n"
-            } else {
-                ""
-            },
-            home_dir,
-            home_dir
-        );
-
-        fs::write(&plist_path, plist_content).expect("Failed to write launchd plist");
-        println!("✅ Created launchd plist at {}", plist_path);
-
-        // Load the service
-        std::process::Command::new("launchctl")
-            .args(["load", &plist_path])
-            .status()
-            .expect("Failed to load launchd service");
-        println!("✅ Loaded cirun-agent service");
-
-        println!("\nService installed successfully!");
-        println!("View logs: tail -f ~/Library/Logs/cirun-agent.log");
-        println!("Stop service: launchctl unload {}", plist_path);
-        println!(
-            "Restart service: launchctl unload {} && launchctl load {}",
-            plist_path, plist_path
-        );
-    } else {
-        eprintln!("Unsupported operating system");
-        std::process::exit(1);
-    }
-}
-
-fn uninstall_service() {
-    println!("Uninstalling cirun-agent system service...");
-
-    if cfg!(target_os = "linux") {
-        let service_path = "/etc/systemd/system/cirun-agent.service";
-
-        // Check if service exists
-        if !std::path::Path::new(service_path).exists() {
-            println!("[ERROR] Service is not installed");
-            std::process::exit(1);
-        }
-
-        // Stop the service
-        println!("Stopping cirun-agent service...");
-        let _ = std::process::Command::new("systemctl")
-            .args(["stop", "cirun-agent"])
-            .status();
-        println!("[OK] Stopped cirun-agent service");
-
-        // Disable the service
-        println!("Disabling cirun-agent service...");
-        let _ = std::process::Command::new("systemctl")
-            .args(["disable", "cirun-agent"])
-            .status();
-        println!("[OK] Disabled cirun-agent service");
-
-        // Remove the service file
-        if let Err(e) = std::fs::remove_file(service_path) {
-            eprintln!("[ERROR] Failed to remove service file: {}", e);
-            std::process::exit(1);
-        }
-        println!("[OK] Removed service file: {}", service_path);
-
-        // Reload systemd
-        std::process::Command::new("systemctl")
-            .args(["daemon-reload"])
-            .status()
-            .expect("Failed to reload systemd");
-        println!("[OK] Reloaded systemd");
-
-        println!("\n[OK] Service uninstalled successfully!");
-    } else if cfg!(target_os = "macos") {
-        let home_dir = std::env::var("HOME").expect("Failed to get HOME directory");
-        let plist_path = format!("{}/Library/LaunchAgents/io.cirun.agent.plist", home_dir);
-
-        // Check if service exists
-        if !std::path::Path::new(&plist_path).exists() {
-            println!("[ERROR] Service is not installed");
-            std::process::exit(1);
-        }
-
-        // Unload the service
-        println!("Unloading cirun-agent service...");
-        match std::process::Command::new("launchctl")
-            .args(["unload", &plist_path])
-            .status()
-        {
-            Ok(_) => println!("[OK] Unloaded cirun-agent service"),
-            Err(e) => {
-                eprintln!("[ERROR] Failed to unload service: {}", e);
-                std::process::exit(1);
-            }
-        }
-
-        // Remove the plist file
-        if let Err(e) = std::fs::remove_file(&plist_path) {
-            eprintln!("[ERROR] Failed to remove plist file: {}", e);
-            std::process::exit(1);
-        }
-        println!("[OK] Removed plist file: {}", plist_path);
-
-        println!("\n[OK] Service uninstalled successfully!");
-    } else {
-        eprintln!("Unsupported operating system");
-        std::process::exit(1);
-    }
-}
-
-// Helper function for running scripts on VMs using meda (simpler version without lume client)
-async fn run_script_on_vm_meda(
-    _meda: &MedaClient,
-    vm_name: &str,
-    ip_address: &str,
-    script_content: &str,
-    login: &RunnerLogin,
-    run_detached: bool,
-) -> Result<String, Box<dyn std::error::Error>> {
-    use std::io::Write;
-    use std::time::Instant;
-    use tempfile::NamedTempFile;
-    use tokio::process::Command;
-
-    info!("VM '{}' is ready with IP: {}", vm_name, ip_address);
-
-    // Step 1: Create a temporary file for the script
-    info!("Creating temporary script file");
-    let mut temp_file = NamedTempFile::new()?;
-    temp_file.write_all(script_content.as_bytes())?;
-    let temp_file_path = temp_file
-        .path()
-        .to_str()
-        .ok_or("Failed to get temporary file path")?;
-
-    // Step 2: Resolve SSH private key path
-    let home_dir = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    let ssh_key_path = format!("{}/.meda/ssh/id_ed25519", home_dir);
-    info!("Using SSH key authentication: {}", ssh_key_path);
-
-    // Step 3: Setup SSH options
-    let ssh_options = vec![
-        "-o",
-        "StrictHostKeyChecking=no",
-        "-o",
-        "UserKnownHostsFile=/dev/null",
-        "-o",
-        "ConnectTimeout=10",
-    ];
-
-    // Step 4: Test SSH connection with retries (SSH may not be ready immediately after VM boot)
-    info!("Waiting for SSH to be ready on VM (max 30 seconds)...");
-    let max_ssh_retries = 6; // 6 retries * 5 seconds = 30 seconds max
-    let mut ssh_ready = false;
-
-    for attempt in 1..=max_ssh_retries {
-        let output = match tokio::time::timeout(
-            tokio::time::Duration::from_secs(30),
-            Command::new("ssh")
-                .arg("-i")
-                .arg(&ssh_key_path)
-                .args(&ssh_options)
-                .arg(format!("{}@{}", login.username, ip_address))
-                .arg("echo 'SSH connection test successful'")
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .output(),
-        )
-        .await
-        {
-            Ok(result) => result?,
-            Err(_) => {
-                warn!(
-                    "SSH connection test timed out after 30s (attempt {}/{})",
-                    attempt, max_ssh_retries
-                );
-                if attempt < max_ssh_retries {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                }
-                continue;
-            }
-        };
-
-        if output.status.success() {
-            info!(
-                "✔ SSH connection successful (attempt {}/{})",
-                attempt, max_ssh_retries
-            );
-            ssh_ready = true;
-            break;
-        } else {
-            let error_msg = String::from_utf8_lossy(&output.stderr);
-            info!(
-                "SSH not ready yet (attempt {}/{}): {}",
-                attempt,
-                max_ssh_retries,
-                error_msg.trim()
-            );
-            if attempt < max_ssh_retries {
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-            }
-        }
-    }
-
-    if !ssh_ready {
-        return Err(
-            "SSH connection failed after multiple retries - VM may not be fully booted".into(),
-        );
-    }
-
-    // Step 5: Copy the script to the VM
-    let remote_script_path = format!("/tmp/script_{}.sh", Instant::now().elapsed().as_secs());
-    info!("Copying script to VM at {}", remote_script_path);
-
-    let output = tokio::time::timeout(
-        tokio::time::Duration::from_secs(60),
-        Command::new("scp")
-            .arg("-i")
-            .arg(&ssh_key_path)
-            .args(&ssh_options)
-            .arg(temp_file_path)
-            .arg(format!(
-                "{}@{}:{}",
-                login.username, ip_address, remote_script_path
-            ))
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output(),
-    )
-    .await
-    .map_err(|_| "SCP transfer timed out after 60s")??;
-
-    if !output.status.success() {
-        let error_msg = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("SCP failed: {}", error_msg).into());
-    }
-
-    info!("✔ SCP transfer successful");
-
-    // Step 6: Execute the script on the VM with sudo (provision scripts need root privileges)
-    // Detached mode gets a short timeout (just needs to launch); blocking mode gets longer.
-    let (script_timeout_secs, script_future) = if run_detached {
-        info!("Executing script on VM in detached mode with sudo");
-        (
-            60u64,
-            Command::new("ssh")
-                .arg("-i")
-                .arg(&ssh_key_path)
-                .args(&ssh_options)
-                .arg(format!("{}@{}", login.username, ip_address))
-                .arg(format!(
-                    "chmod +x {} && sudo nohup bash {} > /tmp/script_stdout.log 2> /tmp/script_stderr.log & echo $!",
-                    remote_script_path, remote_script_path
-                ))
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .output(),
-        )
-    } else {
-        info!("Executing script on VM and waiting for completion with sudo");
-        (
-            600u64,
-            Command::new("ssh")
-                .arg("-i")
-                .arg(&ssh_key_path)
-                .args(&ssh_options)
-                .arg(format!("{}@{}", login.username, ip_address))
-                .arg(format!(
-                    "chmod +x {} && sudo bash {}",
-                    remote_script_path, remote_script_path
-                ))
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .output(),
-        )
-    };
-
-    let output = tokio::time::timeout(
-        tokio::time::Duration::from_secs(script_timeout_secs),
-        script_future,
-    )
-    .await
-    .map_err(|_| format!("Script execution timed out after {}s", script_timeout_secs))??;
-
-    if !output.status.success() {
-        let error_msg = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Script execution failed: {}", error_msg).into());
-    }
-
-    let script_output = String::from_utf8_lossy(&output.stdout).to_string();
-    info!("Script execution completed successfully.");
-    Ok(script_output)
-}
+use bootstrap::{check_sshpass_installed, get_agent_info};
 
 #[tokio::main]
 async fn main() {
     println!("{}", CIRUN_BANNER);
     let args = Args::parse();
 
+    // Handle docker GPU smoke test and exit (no other flags required).
+    if args.docker_smoke_test {
+        env::set_var("RUST_LOG", "info");
+        env_logger::init();
+        let client = crate::docker::client::DockerClient::new();
+        match client.ping() {
+            Ok(v) => info!("docker daemon ok, server={}", v),
+            Err(e) => {
+                error!("docker daemon not reachable: {}", e);
+                std::process::exit(2);
+            }
+        }
+        match client.smoke_test_gpu(&args.docker_smoke_image) {
+            Ok(out) => {
+                println!("{}", out);
+                info!("docker GPU smoke test passed");
+                return;
+            }
+            Err(e) => {
+                error!("docker GPU smoke test failed: {}", e);
+                std::process::exit(3);
+            }
+        }
+    }
+
     // Handle install service flag
     if args.install_service {
-        install_service(&args);
+        service::install(&args);
         return;
     }
 
     // Handle uninstall service flag
     if args.uninstall_service {
-        uninstall_service();
+        service::uninstall();
         return;
     }
 
@@ -1545,10 +145,12 @@ async fn main() {
     let version = env!("CARGO_PKG_VERSION");
     info!("Cirun Agent version: {}", version);
 
-    // Check if sshpass is installed (only required on macOS)
+    // sshpass is only required for the lume executor's SSH provisioning path.
+    // Warn if missing on macOS but do not exit — docker dispatch (Docker Desktop)
+    // works without it, and lume's `run_post_spawn` will surface a clean error
+    // at provision time if needed.
     if cfg!(target_os = "macos") && !check_sshpass_installed() {
-        error!("Exiting: sshpass is required for VM provisioning on macOS");
-        std::process::exit(1);
+        warn!("sshpass not installed — lume executor will fail; docker executor is unaffected");
     }
 
     // Get or generate a persistent agent information
@@ -1567,20 +169,22 @@ async fn main() {
     info!("Hostname: {}", agent_info.hostname);
     info!("OS: {} ({})", agent_info.os, agent_info.arch);
 
-    let default_api_url = "https://api.cirun.io/api/v1";
-    let cirun_api_url = env::var("CIRUN_API_URL").unwrap_or_else(|_| default_api_url.to_string());
+    let cirun_api_url = match config::resolve_api_url() {
+        Ok(u) => u,
+        Err(e) => {
+            error!("{e}");
+            std::process::exit(1);
+        }
+    };
     info!("Cirun API URL: {}", cirun_api_url);
 
     // Determine effective max_vms:
     // - If explicitly provided, use that value
     // - On macOS: default to 2 (Apple Virtualization Framework limit)
     // - On Linux: no limit (None)
-    let max_vms = args.max_vms.or_else(|| {
-        if use_meda() {
-            None // No default limit on Linux
-        } else {
-            Some(MACOS_DEFAULT_MAX_VMS)
-        }
+    let max_vms = args.max_vms.or(match env::consts::OS {
+        "macos" => Some(MACOS_DEFAULT_MAX_VMS),
+        _ => None, // No default limit on Linux
     });
     match max_vms {
         Some(limit) => info!("Max concurrent VMs: {}", limit),
@@ -1595,61 +199,26 @@ async fn main() {
 
     // Set up log cleanup parameters based on platform
     let home_dir = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let log_dir: PathBuf;
+    let log_dir: PathBuf = match env::consts::OS {
+        "macos" => PathBuf::from(&home_dir).join(".lume/logs"),
+        _ => PathBuf::from(&home_dir).join(".meda/logs"),
+    };
 
-    // Download and run the appropriate VM manager based on platform
-    if use_meda() {
-        info!("Detected Linux platform - using Meda for VM management");
+    // Bring up backend daemons that need pre-start (meda + lume; docker uses
+    // the host's docker daemon directly). Selection per-runner happens via
+    // payload; this is just startup-time setup.
+    #[cfg(target_os = "linux")]
+    {
         meda::setup::download_and_run_meda().await;
-        log_dir = PathBuf::from(&home_dir).join(".meda/logs");
-
-        info!("Checking Meda connectivity...");
-        match MedaClient::new() {
-            Ok(meda) => match meda.list_vms().await {
-                Ok(vms) => {
-                    info!("✅ Successfully connected to Meda. Found {} VMs", vms.len());
-                    for vm in vms {
-                        info!("- {} ({})", vm.name, vm.state);
-                    }
-                }
-                Err(e) => {
-                    error!("❌ Failed to connect to Meda API: {:?}", e);
-                    error!("Agent will continue but VM operations will likely fail");
-                }
-            },
-            Err(e) => {
-                error!("❌ Failed to initialize Meda client: {:?}", e);
-                error!("Agent will continue but VM operations will likely fail");
-            }
-        }
-    } else {
-        info!("Detected macOS platform - using Lume for VM management");
-        lume::download_and_run_lume().await;
-        log_dir = PathBuf::from(&home_dir).join(".lume/logs");
-
-        info!("Checking Lume connectivity...");
-        match LumeClient::new() {
-            Ok(lume) => match lume.list_vms().await {
-                Ok(vms) => {
-                    info!("✅ Successfully connected to Lume. Found {} VMs", vms.len());
-                    for vm in vms {
-                        info!(
-                            "- {} ({}, {}, CPU: {}, Memory: {}, Disk: {})",
-                            vm.name, vm.state, vm.os, vm.cpu, vm.memory, vm.disk_size.total
-                        );
-                    }
-                }
-                Err(e) => {
-                    error!("❌ Failed to connect to Lume API: {:?}", e);
-                    error!("Agent will continue but VM operations will likely fail");
-                }
-            },
-            Err(e) => {
-                error!("❌ Failed to initialize Lume client: {:?}", e);
-                error!("Agent will continue but VM operations will likely fail");
-            }
-        }
     }
+    #[cfg(target_os = "macos")]
+    {
+        lume::download_and_run_lume().await;
+    }
+
+    // Seed the runner→executor map from live state. Prevents silent mis-routing
+    // of deletes after an agent restart with runners already on the host.
+    client.seed_runner_executors_from_registry().await;
 
     let mut last_cleanup = SystemTime::now();
     let cleanup_interval = Duration::from_secs(24 * 60 * 60); // Daily log cleanup
@@ -1668,6 +237,14 @@ async fn main() {
             match result {
                 Ok(pr) => {
                     in_flight.remove(&pr.runner_name);
+                    if let Ok(mut s) = client.in_flight.lock() {
+                        s.remove(&pr.runner_name);
+                    }
+                    if let Some(kind) = pr.executor_kind {
+                        if let Ok(mut map) = client.runner_executors.lock() {
+                            map.insert(pr.runner_name.clone(), kind);
+                        }
+                    }
                     match pr.outcome {
                         Ok(()) => {
                             client.clear_retry(&pr.runner_name);
@@ -1714,10 +291,19 @@ async fn main() {
         // Check if it's time to clean up logs
         if let Ok(duration) = SystemTime::now().duration_since(last_cleanup) {
             if duration >= cleanup_interval {
-                let cleanup_result = if use_meda() {
-                    cleanup_meda_logs(&log_dir, 7, 100)
-                } else {
-                    cleanup_lume_logs(&log_dir, 7, 100)
+                let cleanup_result: Result<(), Box<dyn std::error::Error>> = {
+                    #[cfg(target_os = "macos")]
+                    {
+                        cleanup_lume_logs(&log_dir, 7, 100)
+                    }
+                    #[cfg(target_os = "linux")]
+                    {
+                        cleanup_meda_logs(&log_dir, 7, 100)
+                    }
+                    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                    {
+                        Ok(())
+                    }
                 };
 
                 match cleanup_result {
@@ -1738,9 +324,15 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bootstrap::{get_agent_info, get_hostname};
+    // generate_template_name lives in crate::lume which is macos-only.
+    // The tests that rely on it are gated below.
+    #[cfg(target_os = "macos")]
+    use crate::lume::generate_template_name;
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_template_name_generation() {
         let config1 = TemplateConfig {
