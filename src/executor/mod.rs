@@ -168,6 +168,19 @@ pub enum ProvisionError {
     /// Spec is incompatible with this executor (e.g. lume + GPU). Never retry.
     #[error("incompatible: {0}")]
     Incompatible(String),
+    /// Underlying host (meda's admission control today) is at capacity.
+    /// The caller MUST NOT count this against the runner's retry budget
+    /// and SHOULD signal upstream so the backend can mark the GH check
+    /// run as "queued, host at capacity" rather than "provisioning
+    /// failed". The runner stays in the backend's `requested` pool and
+    /// gets re-fanned on the next poll.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[error("host_full ({code}): {message}")]
+    HostFull {
+        code: String,
+        message: String,
+        retry_after_secs: u64,
+    },
 }
 
 #[async_trait]

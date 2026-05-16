@@ -9,6 +9,7 @@ mod lume;
 #[cfg(target_os = "linux")]
 mod meda;
 mod provision;
+mod reporting;
 mod service;
 mod ssh;
 #[cfg(target_os = "macos")]
@@ -245,18 +246,16 @@ async fn main() {
                             map.insert(pr.runner_name.clone(), kind);
                         }
                     }
-                    match pr.outcome {
-                        Ok(()) => {
-                            client.clear_retry(&pr.runner_name);
-                            any_provision_succeeded = true;
-                        }
-                        Err(error_msg) => {
-                            let attempt = client.increment_retry(&pr.runner_name);
-                            client
-                                .notify_provision_failure(&pr.runner_name, error_msg, attempt)
-                                .await;
-                        }
+                    // All per-outcome dispatch (retry math, which HTTP
+                    // payload to send) lives in the ProvisionReporter
+                    // impl on CirunClient. main.rs just lifts the
+                    // outcome into the event vocabulary and emits.
+                    let event = crate::reporting::ProvisionEvent::from(pr);
+                    if event.is_success() {
+                        any_provision_succeeded = true;
                     }
+                    use crate::reporting::ProvisionReporter;
+                    client.report(event).await;
                 }
                 Err(e) => {
                     error!("Provisioning task panicked: {}", e);
@@ -323,6 +322,7 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(test, target_os = "macos"))]
     use super::*;
     use crate::bootstrap::{get_agent_info, get_hostname};
     // generate_template_name lives in crate::lume which is macos-only.

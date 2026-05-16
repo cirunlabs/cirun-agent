@@ -17,13 +17,36 @@ use log::{error, info};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
+/// Outcome of a single runner provisioning attempt. Distinguishes three
+/// cases that the main loop must treat differently:
+///
+/// - `Success` — runner is up and registered; clear retry count.
+/// - `Failed` — real failure (executor error, bad spec, network). Burn
+///   a retry slot and notify the backend so SaaS can mark the runner
+///   failed (or retry it depending on `max_retries`).
+/// - `HostFull` — meda admission control denied the request because
+///   the host is at capacity. The runner was NEVER spawned; we MUST
+///   NOT count this against `max_retries` and we SHOULD push the
+///   structured reason upstream so the backend can surface "queued,
+///   host at capacity" on the GitHub check run instead of "failed".
+pub enum ProvisionOutcome {
+    Success,
+    Failed(String),
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    HostFull {
+        code: String,
+        message: String,
+        retry_after_secs: u64,
+    },
+}
+
 /// Result of a single runner provisioning attempt
 pub struct ProvisionResult {
     pub runner_name: String,
     /// Executor that handled the runner. `None` when derivation failed
     /// (we never started provisioning).
     pub executor_kind: Option<crate::executor::ExecutorKind>,
-    pub outcome: Result<(), String>,
+    pub outcome: ProvisionOutcome,
 }
 
 /// Provision a single runner in its own task. Acquires a semaphore permit to
@@ -86,7 +109,7 @@ pub async fn provision_single_runner(
             return ProvisionResult {
                 runner_name: runner.name.clone(),
                 executor_kind: None,
-                outcome: Err(format!("Cannot derive executor: {e}")),
+                outcome: ProvisionOutcome::Failed(format!("Cannot derive executor: {e}")),
             };
         }
     };
@@ -132,7 +155,10 @@ pub async fn provision_single_runner(
                             return ProvisionResult {
                                 runner_name: runner.name.clone(),
                                 executor_kind: Some(executor_kind),
-                                outcome: Err(format!("Template creation failed: {}", e)),
+                                outcome: ProvisionOutcome::Failed(format!(
+                                    "Template creation failed: {}",
+                                    e
+                                )),
                             };
                         }
                     }
@@ -158,7 +184,7 @@ pub async fn provision_single_runner(
             return ProvisionResult {
                 runner_name: runner.name.clone(),
                 executor_kind: Some(executor_kind),
-                outcome: Err("No template available".to_string()),
+                outcome: ProvisionOutcome::Failed("No template available".to_string()),
             };
         }
     };
@@ -192,7 +218,7 @@ pub async fn provision_single_runner(
             return ProvisionResult {
                 runner_name: runner.name.clone(),
                 executor_kind: Some(executor_kind),
-                outcome: Err(format!("Invalid gpu request: {e}")),
+                outcome: ProvisionOutcome::Failed(format!("Invalid gpu request: {e}")),
             };
         }
     };
@@ -214,34 +240,56 @@ pub async fn provision_single_runner(
     // Dispatch through the host registry (probed at startup) so a backend
     // that wasn't reachable then doesn't get a late attempt against a fresh
     // client.
-    let result: Result<(), String> = match registry.get(executor_kind) {
-        Ok(exec) => exec.provision(&spec).await.map_err(|e| e.to_string()),
-        Err(e) => Err(e.to_string()),
-    };
-
-    match result {
-        Ok(()) => {
-            info!(
-                "Successfully provisioned runner: {} using template {}",
-                runner.name, template_name
-            );
-            ProvisionResult {
-                runner_name: runner.name.clone(),
-                executor_kind: Some(executor_kind),
-                outcome: Ok(()),
+    let outcome = match registry.get(executor_kind) {
+        Ok(exec) => match exec.provision(&spec).await {
+            Ok(()) => {
+                info!(
+                    "Successfully provisioned runner: {} using template {}",
+                    runner.name, template_name
+                );
+                ProvisionOutcome::Success
             }
-        }
+            // HostFull is admission backpressure, NOT a real failure.
+            // Preserve the structured reason so the main loop can route
+            // it to `notify_at_capacity` instead of burning a retry
+            // slot via `notify_provision_failure`.
+            Err(crate::executor::ProvisionError::HostFull {
+                code,
+                message,
+                retry_after_secs,
+            }) => {
+                info!(
+                    "Host at capacity for runner {}: {} ({}). Retry-After {}s",
+                    runner.name, message, code, retry_after_secs
+                );
+                ProvisionOutcome::HostFull {
+                    code,
+                    message,
+                    retry_after_secs,
+                }
+            }
+            Err(e) => {
+                let error_msg = e.to_string();
+                error!(
+                    "Failed to provision runner {} using template {}: {}",
+                    runner.name, template_name, error_msg
+                );
+                ProvisionOutcome::Failed(error_msg)
+            }
+        },
         Err(e) => {
             let error_msg = e.to_string();
             error!(
-                "Failed to provision runner {} using template {}: {}",
-                runner.name, template_name, error_msg
+                "Failed to provision runner {} (registry lookup): {}",
+                runner.name, error_msg
             );
-            ProvisionResult {
-                runner_name: runner.name.clone(),
-                executor_kind: Some(executor_kind),
-                outcome: Err(error_msg),
-            }
+            ProvisionOutcome::Failed(error_msg)
         }
+    };
+
+    ProvisionResult {
+        runner_name: runner.name.clone(),
+        executor_kind: Some(executor_kind),
+        outcome,
     }
 }

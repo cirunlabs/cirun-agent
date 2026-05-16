@@ -57,10 +57,23 @@ impl Executor for MedaExecutor {
             cpus: Some(spec.cpu),
             disk_size: Some(format!("{}G", spec.disk_gb)),
         };
-        self.client
-            .run_vm(req)
-            .await
-            .map_err(|e| ProvisionError::Transient(format!("meda run_vm: {e:?}")))
+        // Map admission-control 503s onto ProvisionError::HostFull so
+        // the provision flow can signal "at capacity" upstream without
+        // burning the runner's retry budget. Other meda errors are
+        // genuine failures and stay as Transient.
+        match self.client.run_vm(req).await {
+            Ok(()) => Ok(()),
+            Err(crate::meda::errors::MedaError::HostFull {
+                code,
+                message,
+                retry_after_secs,
+            }) => Err(ProvisionError::HostFull {
+                code,
+                message,
+                retry_after_secs,
+            }),
+            Err(e) => Err(ProvisionError::Transient(format!("meda run_vm: {e:?}"))),
+        }
     }
 
     async fn kill(&self, name: &str) -> Result<(), ProvisionError> {
