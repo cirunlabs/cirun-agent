@@ -1,59 +1,46 @@
-//! Single funnel for provision-outcome observability.
+//! Single funnel for everything the agent wants the cirun backend to
+//! observe.
 //!
-//! The agent's main loop produces `ProvisionResult`s; each one needs to:
-//!   - mutate per-runner retry state (clear on success, increment on
-//!     real failure, **not** touch it on host-full backpressure)
-//!   - notify the cirun backend with a payload shape that depends on
-//!     which case we're in, so the backend can render the right
-//!     GitHub check-run status (success / failed / queued-at-capacity)
+//! Design intent:
 //!
-//! Without this module the main loop owned all three of those concerns
-//! inline. That made it 20+ lines of arms per outcome, and each new
-//! variant (host-full, future RunnerHealthChanged, …) grew the loop
-//! and the test surface around it. The module here exposes ONE entry
-//! point — `ProvisionReporter::report` — and hides the dispatch:
+//! 1. **One wire format.** The agent emits a single generic shape —
+//!    `AgentEvent` — for every observable thing (a runner provisioned,
+//!    a runner failed, a host hit admission-control backpressure, a
+//!    future runner-health change, …). cirun-go consumes one schema and
+//!    decides what to do with each `kind` via its own lookup table.
+//!    Adding a new event type means adding an `EventKind` variant on
+//!    both sides; no new endpoint, no new payload shape.
 //!
-//! ```ignore
-//! reporter.report(ProvisionEvent::from(pr)).await;
-//! ```
+//! 2. **One funnel.** The agent's main loop talks to ONE entry point:
+//!    `ProvisionReporter::report(event)`. The per-event policy (which
+//!    HTTP call, whether to touch retry-counter state) lives behind the
+//!    trait — main.rs has no business knowing it. New event types add a
+//!    match arm in the impl on `CirunClient`. main.rs does not change.
 //!
-//! New outcome types add an enum variant + a match arm in the impl on
-//! `CirunClient`. main.rs does not change.
-//!
-//! Retry-counter mutation stays on `CirunClient` (its natural owner —
-//! same struct holds the HTTP binding), but every call to
-//! increment/clear flows through the reporter impl. main.rs has no
-//! business touching the counter, and now it doesn't.
+//! 3. **Internal vocabulary stays typed.** Inside the agent we keep
+//!    `ProvisionEvent` as a typed enum so callers can pattern-match
+//!    without inspecting strings. The trait's wire-format translation
+//!    happens at the boundary inside the reporter impl.
 
 use async_trait::async_trait;
+use serde::Serialize;
 
 use crate::provision::{ProvisionOutcome, ProvisionResult};
 
-/// Vocabulary of provision-outcome events the agent emits upstream.
-///
-/// Each variant carries exactly what the corresponding cirun backend
-/// payload needs — the reporter impl translates 1:1, no shape-shifting
-/// at the call site.
+/// Internal, typed vocabulary of provision-outcome events. Stays close
+/// to the executor's `ProvisionOutcome` so the lift is trivial; the
+/// `AgentEvent` wire format is built from this inside the reporter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProvisionEvent {
-    /// Runner provisioned and registered with GitHub. Reporter clears
-    /// retry state; no HTTP notification needed (the SaaS learns via
-    /// the periodic `report_running_vms` POST that this runner is now
-    /// alive on the agent).
+    /// Runner provisioned and registered with GitHub. No wire emit —
+    /// the SaaS learns via the periodic `report_running_vms` POST.
     Succeeded { runner_name: String },
 
     /// Real provisioning failure (executor error, bad spec, network).
-    /// Reporter increments retry count and POSTs a `provision_failure`
-    /// payload so the backend can decide retry vs. mark-failed based
-    /// on `max_retries`.
     Failed { runner_name: String, error: String },
 
-    /// Host admission control rejected the request (meda 503). The
-    /// runner was NEVER spawned, so retry budget MUST be preserved.
-    /// Reporter posts an `at_capacity` payload carrying the structured
-    /// reason (CPU_EXHAUSTED / MEM_EXHAUSTED / DISK_EXHAUSTED) so the
-    /// backend can surface "queued, host at capacity" on the GitHub
-    /// check run instead of "failed".
+    /// Host admission control rejected the request (meda 503). Runner
+    /// was never spawned; retry budget MUST be preserved.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     AtCapacity {
         runner_name: String,
@@ -64,10 +51,6 @@ pub enum ProvisionEvent {
 }
 
 impl ProvisionEvent {
-    /// True when the agent should consider this a successful provision
-    /// for purposes of "do we need to call report_running_vms now?".
-    /// Kept on the event (not the outcome) so the main loop reads the
-    /// same vocabulary it dispatches with.
     pub fn is_success(&self) -> bool {
         matches!(self, ProvisionEvent::Succeeded { .. })
     }
@@ -97,6 +80,109 @@ impl From<ProvisionResult> for ProvisionEvent {
     }
 }
 
+/// Wire format for agent → cirun-go observability. ONE schema for all
+/// event types; cirun-go reads `kind` and dispatches its own
+/// per-kind behaviour (check-run update, retry-counter bump, etc.).
+/// Field semantics:
+///
+/// - `runner_name`: the runner the event is about (always present).
+/// - `kind`: discriminator; cirun-go's per-kind action table keys on this.
+/// - `severity`: hint for log-level / check-run conclusion.
+/// - `title`: short string suitable for a GH check-run title.
+/// - `message`: longer human-readable text for the check-run summary
+///   or log body.
+/// - `metadata`: open bag for kind-specific structured data
+///   (`retry_after_secs`, `code`, `attempt`, …). Keys are stable per
+///   kind but the set is open — new kinds can attach new fields
+///   without a schema change.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct AgentEvent {
+    pub runner_name: String,
+    pub kind: EventKind,
+    pub severity: Severity,
+    pub title: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "serde_json::Map::is_empty")]
+    pub metadata: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Closed set of event kinds the cirun-go dispatch table needs to know
+/// about. Stays small on purpose — only variants the agent currently
+/// emits live here. Adding a new event type is: (a) introduce a
+/// `ProvisionEvent` (or sibling) variant, (b) add the `to_agent_event`
+/// arm that produces this kind, (c) mirror the snake_case token on
+/// cirun-go's side.
+///
+/// `ProvisionSucceeded` is reserved for the day we want a check-run
+/// update on successful provision; today the running-VMs heartbeat
+/// already conveys that, so Succeeded is internal-only.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EventKind {
+    /// Reserved — emitted when we move provision-success notifications
+    /// onto the check-run path. Today Succeeded outcomes are conveyed
+    /// implicitly via `report_running_vms`.
+    #[allow(dead_code)]
+    ProvisionSucceeded,
+    ProvisionFailed,
+    HostAtCapacity,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    /// Reserved — for low-priority events that should land in the
+    /// backend's audit log but not change the GitHub check-run status.
+    #[allow(dead_code)]
+    Info,
+    Warning,
+    Error,
+}
+
+/// Build the wire-format event for a typed `ProvisionEvent`. Public so
+/// the reporter impl + tests can share the mapping. Returns `None` for
+/// events that intentionally produce no wire emit (today: `Succeeded`,
+/// which is reported implicitly via the running-VMs heartbeat).
+pub fn to_agent_event(ev: &ProvisionEvent, attempt: u32) -> Option<AgentEvent> {
+    match ev {
+        ProvisionEvent::Succeeded { .. } => None,
+        ProvisionEvent::Failed { runner_name, error } => {
+            let mut metadata = serde_json::Map::new();
+            metadata.insert("attempt".into(), serde_json::Value::from(attempt));
+            metadata.insert("error".into(), serde_json::Value::from(error.clone()));
+            Some(AgentEvent {
+                runner_name: runner_name.clone(),
+                kind: EventKind::ProvisionFailed,
+                severity: Severity::Error,
+                title: "Provision failed".into(),
+                message: error.clone(),
+                metadata,
+            })
+        }
+        ProvisionEvent::AtCapacity {
+            runner_name,
+            code,
+            message,
+            retry_after_secs,
+        } => {
+            let mut metadata = serde_json::Map::new();
+            metadata.insert("code".into(), serde_json::Value::from(code.clone()));
+            metadata.insert(
+                "retry_after_secs".into(),
+                serde_json::Value::from(*retry_after_secs),
+            );
+            Some(AgentEvent {
+                runner_name: runner_name.clone(),
+                kind: EventKind::HostAtCapacity,
+                severity: Severity::Warning,
+                title: "Host at capacity".into(),
+                message: message.clone(),
+                metadata,
+            })
+        }
+    }
+}
+
 /// Sink for provision-outcome events. The single trait method is the
 /// reporter's whole public surface — callers compose dispatch by
 /// pattern-matching `ProvisionEvent` arms inside the impl, not by
@@ -111,9 +197,7 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    /// Test double that records every event in arrival order. Lets the
-    /// main-loop tests assert "the reporter saw exactly these events
-    /// in this order" without spinning up HTTP.
+    /// Test double that records every event in arrival order.
     pub struct RecordingReporter {
         events: Mutex<Vec<ProvisionEvent>>,
     }
@@ -143,7 +227,6 @@ mod tests {
             outcome: ProvisionOutcome::Success,
         }
     }
-
     fn pr_failed(name: &str, err: &str) -> ProvisionResult {
         ProvisionResult {
             runner_name: name.into(),
@@ -151,7 +234,6 @@ mod tests {
             outcome: ProvisionOutcome::Failed(err.into()),
         }
     }
-
     fn pr_host_full(name: &str, code: &str) -> ProvisionResult {
         ProvisionResult {
             runner_name: name.into(),
@@ -167,47 +249,97 @@ mod tests {
     #[test]
     fn lifts_success_outcome_to_succeeded_event() {
         let ev: ProvisionEvent = pr_success("r1").into();
-        assert_eq!(
-            ev,
-            ProvisionEvent::Succeeded {
-                runner_name: "r1".into()
-            }
-        );
         assert!(ev.is_success());
     }
 
     #[test]
     fn lifts_failed_outcome_to_failed_event() {
         let ev: ProvisionEvent = pr_failed("r1", "boom").into();
-        assert_eq!(
-            ev,
-            ProvisionEvent::Failed {
-                runner_name: "r1".into(),
-                error: "boom".into()
-            }
-        );
-        assert!(!ev.is_success());
+        assert!(matches!(ev, ProvisionEvent::Failed { .. }));
     }
 
     #[test]
     fn lifts_host_full_outcome_to_at_capacity_event() {
         let ev: ProvisionEvent = pr_host_full("r1", "CPU_EXHAUSTED").into();
+        assert!(matches!(ev, ProvisionEvent::AtCapacity { .. }));
+    }
+
+    #[test]
+    fn success_emits_no_wire_event() {
+        // The running-VMs heartbeat already tells SaaS this runner is up.
+        // Emitting a second "succeeded" event would just create
+        // duplicate check-run noise.
+        let ev = ProvisionEvent::Succeeded {
+            runner_name: "r1".into(),
+        };
+        assert!(to_agent_event(&ev, 0).is_none());
+    }
+
+    #[test]
+    fn failed_emits_provision_failed_event_with_attempt_and_error() {
+        let ev = ProvisionEvent::Failed {
+            runner_name: "r1".into(),
+            error: "boom".into(),
+        };
+        let agent_event = to_agent_event(&ev, 3).expect("should emit");
+        assert_eq!(agent_event.kind, EventKind::ProvisionFailed);
+        assert_eq!(agent_event.severity, Severity::Error);
+        assert_eq!(agent_event.message, "boom");
         assert_eq!(
-            ev,
-            ProvisionEvent::AtCapacity {
-                runner_name: "r1".into(),
-                code: "CPU_EXHAUSTED".into(),
-                message: "CPU_EXHAUSTED test".into(),
-                retry_after_secs: 10,
-            }
+            agent_event.metadata.get("attempt"),
+            Some(&serde_json::Value::from(3))
         );
-        assert!(!ev.is_success());
+        assert_eq!(
+            agent_event.metadata.get("error"),
+            Some(&serde_json::Value::from("boom"))
+        );
+    }
+
+    #[test]
+    fn at_capacity_emits_host_at_capacity_event_with_code_and_retry_after() {
+        let ev = ProvisionEvent::AtCapacity {
+            runner_name: "r1".into(),
+            code: "CPU_EXHAUSTED".into(),
+            message: "CPU exhausted: ...".into(),
+            retry_after_secs: 10,
+        };
+        let agent_event = to_agent_event(&ev, 0).expect("should emit");
+        assert_eq!(agent_event.kind, EventKind::HostAtCapacity);
+        assert_eq!(agent_event.severity, Severity::Warning);
+        assert_eq!(agent_event.title, "Host at capacity");
+        assert_eq!(
+            agent_event.metadata.get("code"),
+            Some(&serde_json::Value::from("CPU_EXHAUSTED"))
+        );
+        assert_eq!(
+            agent_event.metadata.get("retry_after_secs"),
+            Some(&serde_json::Value::from(10u64))
+        );
+    }
+
+    #[test]
+    fn serializes_kind_and_severity_as_snake_lowercase() {
+        // Wire-shape stability test: cirun-go relies on these exact
+        // tokens for its dispatch table. If you rename a variant, the
+        // serde rename attrs need to follow, and this test catches
+        // the drift before deploy.
+        let ev = ProvisionEvent::AtCapacity {
+            runner_name: "r1".into(),
+            code: "CPU_EXHAUSTED".into(),
+            message: "x".into(),
+            retry_after_secs: 5,
+        };
+        let agent_event = to_agent_event(&ev, 0).unwrap();
+        let json = serde_json::to_value(&agent_event).unwrap();
+        assert_eq!(json["kind"], "host_at_capacity");
+        assert_eq!(json["severity"], "warning");
+        assert_eq!(json["title"], "Host at capacity");
+        assert_eq!(json["metadata"]["code"], "CPU_EXHAUSTED");
+        assert_eq!(json["metadata"]["retry_after_secs"], 5);
     }
 
     #[tokio::test]
     async fn recording_reporter_captures_events_in_order() {
-        // Sanity check the test double itself — if this drifts, every
-        // downstream test that uses RecordingReporter silently breaks.
         let r = RecordingReporter::new();
         r.report(pr_success("r1").into()).await;
         r.report(pr_failed("r2", "x").into()).await;

@@ -263,35 +263,29 @@ impl CirunClient {
         self.get_retry_count(runner_name) < max_retries
     }
 
-    /// POST a structured `at_capacity` event for a single runner. Called
-    /// from the `ProvisionReporter::report` impl when meda admission
-    /// control returned 503; the backend uses it to render
-    /// "queued, host at capacity" on the GitHub check run instead of
-    /// "failed". `pub(crate)` because the public entry point is now
-    /// `<Self as ProvisionReporter>::report` — direct callers would
-    /// bypass the retry-budget policy.
-    pub(crate) async fn notify_at_capacity(
-        &self,
-        runner_name: &str,
-        code: &str,
-        message: &str,
-        retry_after_secs: u64,
-    ) {
+    /// POST a generic `AgentEvent` to the cirun-go backend. ONE entry
+    /// point for all agent → backend observability — cirun-go reads
+    /// `event.kind` and dispatches per its own action table (update
+    /// check run, bump DB retry counter, log, …). Adding a new event
+    /// kind on the agent side means: add an `EventKind` variant in
+    /// `src/reporting.rs`, add a `to_agent_event` arm, mirror the kind
+    /// string on cirun-go. No new HTTP route. No new payload schema.
+    ///
+    /// `pub(crate)` because the public entry point is the
+    /// `ProvisionReporter::report` trait method; direct callers would
+    /// bypass the retry-counter policy that's coupled to certain
+    /// event kinds.
+    pub(crate) async fn notify_event(&self, event: &crate::reporting::AgentEvent) {
         let url = format!("{}/agent", self.base_url);
 
         info!(
-            "Notifying API host at capacity for {}: {} ({}). Retry-After {}s",
-            runner_name, message, code, retry_after_secs
+            "Emitting agent event runner={} kind={:?} severity={:?}: {}",
+            event.runner_name, event.kind, event.severity, event.title
         );
 
         let request_data = json!({
             "agent": self.agent,
-            "at_capacity": {
-                "runner_name": runner_name,
-                "code": code,
-                "message": message,
-                "retry_after_secs": retry_after_secs,
-            }
+            "event": event,
         });
 
         match self
@@ -302,65 +296,16 @@ impl CirunClient {
         {
             Ok(response) => {
                 if response.status().is_success() {
-                    debug!("Successfully notified API of at-capacity event");
+                    debug!("Successfully posted agent event");
                 } else {
                     warn!(
-                        "API returned non-success status for at-capacity notification: {}",
+                        "API returned non-success status for agent event: {}",
                         response.status()
                     );
                 }
             }
             Err(e) => {
-                warn!("Failed to notify API of at-capacity event: {}", e);
-            }
-        }
-    }
-
-    /// POST a `provision_failure` event for a single runner. Called from
-    /// the `ProvisionReporter::report` impl after `increment_retry` has
-    /// bumped the per-runner counter. `pub(crate)` — direct callers
-    /// would bypass the retry-counter increment that's coupled to this
-    /// event.
-    pub(crate) async fn notify_provision_failure(
-        &self,
-        runner_name: &str,
-        error: String,
-        attempt: u32,
-    ) {
-        let url = format!("{}/agent", self.base_url);
-
-        info!(
-            "Notifying API of provisioning failure for {} (attempt {})",
-            runner_name, attempt
-        );
-
-        let request_data = json!({
-            "agent": self.agent,
-            "provision_failure": {
-                "runner_name": runner_name,
-                "error": error,
-                "attempt": attempt,
-            }
-        });
-
-        match self
-            .create_request(reqwest::Method::POST, &url)
-            .json(&request_data)
-            .send()
-            .await
-        {
-            Ok(response) => {
-                if response.status().is_success() {
-                    debug!("Successfully notified API of provisioning failure");
-                } else {
-                    warn!(
-                        "API returned non-success status for failure notification: {}",
-                        response.status()
-                    );
-                }
-            }
-            Err(e) => {
-                warn!("Failed to notify API of provisioning failure: {}", e);
+                warn!("Failed to post agent event: {}", e);
             }
         }
     }
@@ -440,7 +385,10 @@ impl CirunClient {
                 json.runners_to_provision.len()
             );
 
-            // First, handle retry-exhausted runners (notify API, skip them)
+            // First, handle retry-exhausted runners (notify API, skip them).
+            // Same agent-event funnel used elsewhere: emit a
+            // ProvisionEvent::Failed and let the reporter impl build the
+            // wire payload so cirun-go gets the consistent shape.
             for runner in &json.runners_to_provision {
                 let current_attempts = self.get_retry_count(&runner.name);
                 if !self.should_retry(&runner.name, runner.max_retries) {
@@ -448,11 +396,11 @@ impl CirunClient {
                         "Runner '{}' has exceeded max retries ({}/{}). Skipping provisioning.",
                         runner.name, current_attempts, runner.max_retries
                     );
-                    self.notify_provision_failure(
-                        &runner.name,
-                        format!("Exceeded max retries ({})", runner.max_retries),
-                        current_attempts,
-                    )
+                    use crate::reporting::ProvisionReporter;
+                    self.report(crate::reporting::ProvisionEvent::Failed {
+                        runner_name: runner.name.clone(),
+                        error: format!("Exceeded max retries ({})", runner.max_retries),
+                    })
                     .await;
                 }
             }
@@ -586,34 +534,29 @@ impl CirunClient {
 #[async_trait::async_trait]
 impl crate::reporting::ProvisionReporter for CirunClient {
     async fn report(&self, event: crate::reporting::ProvisionEvent) {
-        use crate::reporting::ProvisionEvent;
-        match event {
+        use crate::reporting::{to_agent_event, ProvisionEvent};
+
+        // Per-event POLICY: retry-counter mutation. AtCapacity does NOT
+        // increment because the runner was never spawned (admission
+        // denial); the runner stays in the SaaS's `requested` pool to
+        // be re-fanned on the next poll. Succeeded clears any prior
+        // retry state. Failed bumps the counter for max_retries
+        // accounting and the attempt number rides on the wire event.
+        let attempt = match &event {
             ProvisionEvent::Succeeded { runner_name } => {
-                // No HTTP notify: the SaaS learns about the running
-                // runner via the periodic `report_running_vms` POST.
-                // Clearing the retry counter is the local-state half
-                // of "this runner is now healthy on this agent".
-                self.clear_retry(&runner_name);
+                self.clear_retry(runner_name);
+                0
             }
-            ProvisionEvent::Failed { runner_name, error } => {
-                let attempt = self.increment_retry(&runner_name);
-                self.notify_provision_failure(&runner_name, error, attempt)
-                    .await;
-            }
-            ProvisionEvent::AtCapacity {
-                runner_name,
-                code,
-                message,
-                retry_after_secs,
-            } => {
-                // Intentionally NOT incrementing the retry counter —
-                // admission-control denial means the runner was never
-                // spawned, so it shouldn't count against the runner's
-                // `max_retries`. The runner stays in the SaaS's
-                // `requested` pool and re-fans on the next poll.
-                self.notify_at_capacity(&runner_name, &code, &message, retry_after_secs)
-                    .await;
-            }
+            ProvisionEvent::Failed { runner_name, .. } => self.increment_retry(runner_name),
+            ProvisionEvent::AtCapacity { .. } => 0,
+        };
+
+        // WIRE: build the generic AgentEvent and post it through the
+        // single observability funnel. Succeeded returns None today —
+        // the running-VMs heartbeat already tells SaaS the runner is up,
+        // so we skip the wire emit to avoid duplicate check-run noise.
+        if let Some(agent_event) = to_agent_event(&event, attempt) {
+            self.notify_event(&agent_event).await;
         }
     }
 }
