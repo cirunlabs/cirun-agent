@@ -57,10 +57,12 @@ Install and run cirun-agent as a persistent system service (survives reboots):
 
 ```bash
 # Linux (systemd)
-sudo cirun-agent --api-token YOUR_TOKEN --install-service
+export CIRUN_API_TOKEN=YOUR_TOKEN
+sudo -E cirun-agent --install-service
 
 # macOS (launchd)
-cirun-agent --api-token YOUR_TOKEN --install-service
+export CIRUN_API_TOKEN=YOUR_TOKEN
+cirun-agent --install-service
 ```
 
 The service will:
@@ -71,29 +73,30 @@ The service will:
 ### Run Manually
 
 ```bash
-cirun-agent --api-token YOUR_TOKEN
+export CIRUN_API_TOKEN=YOUR_TOKEN
+cirun-agent
 ```
 
 For more details, checkout docs: https://docs.cirun.io/on-prem
 
 ## ⚙️ Configuration
 
+### Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `CIRUN_API_TOKEN` | API token for authentication (**preferred** — keeps the secret out of argv / `ps` / shell traces). Required unless installing/uninstalling the service. | — |
+| `CIRUN_API_URL` | Base URL for Cirun API | https://api.cirun.io/api/v1 |
+
 ### Command Line Arguments
 
 | Argument | Short | Description | Default |
 |----------|-------|-------------|---------|
-| `--api-token` | `-a` | API token for authentication | (Required) |
 | `--interval` | `-i` | Polling interval in seconds | 5 |
 | `--id-file` | `-f` | Agent ID file path | .agent_id |
 | `--verbose` | `-v` | Enable verbose logging | false |
 | `--install-service` | | Install as system service | false |
 | `--max-vms` | | Maximum concurrent VMs (min: 1) | 2 (macOS), unlimited (Linux) |
-
-### Environment Variables
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `CIRUN_API_URL` | Base URL for Cirun API | https://api.cirun.io/api/v1 |
 
 ## 🔌 Virtualization
 
@@ -111,7 +114,8 @@ Set up the agent on any machine with virtualization capabilities to automaticall
 
 ```bash
 # Run with custom polling interval (30 seconds)
-cirun-agent --api-token YOUR_API_TOKEN --interval 30
+export CIRUN_API_TOKEN=YOUR_TOKEN
+cirun-agent --interval 30
 ```
 
 ### Custom Runner Templates
@@ -126,7 +130,8 @@ Control the maximum number of VMs running simultaneously:
 
 ```bash
 # Limit to 5 concurrent VMs (useful for resource management)
-cirun-agent --api-token YOUR_API_TOKEN --max-vms 5
+export CIRUN_API_TOKEN=YOUR_TOKEN
+cirun-agent --max-vms 5
 
 # macOS automatically defaults to 2 VMs (Apple Virtualization Framework limit)
 # Linux has no default limit unless specified
@@ -205,7 +210,8 @@ cargo fmt -- --check && cargo clippy
 Enable detailed logs by setting the `RUST_LOG` environment variable:
 
 ```bash
-RUST_LOG=debug cirun-agent --api-token YOUR_API_TOKEN
+export CIRUN_API_TOKEN=YOUR_TOKEN
+RUST_LOG=debug cirun-agent
 ```
 
 
