@@ -31,13 +31,33 @@ use tokio::sync::Semaphore;
 ///   host at capacity" on the GitHub check run instead of "failed".
 pub enum ProvisionOutcome {
     Success,
-    Failed(String),
+    /// Real provisioning failure. `diagnostics` is an open-ended bag —
+    /// most call sites have nothing structured to attach (empty map),
+    /// but the meda detached-exec failure path stuffs SSH timing +
+    /// VM-side state captures here so the upstream `AgentEvent` can
+    /// carry them to cirun-go.
+    Failed {
+        error: String,
+        diagnostics: serde_json::Map<String, serde_json::Value>,
+    },
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     HostFull {
         code: String,
         message: String,
         retry_after_secs: u64,
     },
+}
+
+impl ProvisionOutcome {
+    /// Build a `Failed` outcome with no structured diagnostics. Sites
+    /// that want to attach a metadata bag construct the variant
+    /// directly with `ProvisionOutcome::Failed { error, diagnostics }`.
+    pub fn failed(msg: impl Into<String>) -> Self {
+        Self::Failed {
+            error: msg.into(),
+            diagnostics: serde_json::Map::new(),
+        }
+    }
 }
 
 /// Result of a single runner provisioning attempt
@@ -109,7 +129,7 @@ pub async fn provision_single_runner(
             return ProvisionResult {
                 runner_name: runner.name.clone(),
                 executor_kind: None,
-                outcome: ProvisionOutcome::Failed(format!("Cannot derive executor: {e}")),
+                outcome: ProvisionOutcome::failed(format!("Cannot derive executor: {e}")),
             };
         }
     };
@@ -155,7 +175,7 @@ pub async fn provision_single_runner(
                             return ProvisionResult {
                                 runner_name: runner.name.clone(),
                                 executor_kind: Some(executor_kind),
-                                outcome: ProvisionOutcome::Failed(format!(
+                                outcome: ProvisionOutcome::failed(format!(
                                     "Template creation failed: {}",
                                     e
                                 )),
@@ -184,7 +204,7 @@ pub async fn provision_single_runner(
             return ProvisionResult {
                 runner_name: runner.name.clone(),
                 executor_kind: Some(executor_kind),
-                outcome: ProvisionOutcome::Failed("No template available".to_string()),
+                outcome: ProvisionOutcome::failed("No template available".to_string()),
             };
         }
     };
@@ -218,7 +238,7 @@ pub async fn provision_single_runner(
             return ProvisionResult {
                 runner_name: runner.name.clone(),
                 executor_kind: Some(executor_kind),
-                outcome: ProvisionOutcome::Failed(format!("Invalid gpu request: {e}")),
+                outcome: ProvisionOutcome::failed(format!("Invalid gpu request: {e}")),
             };
         }
     };
@@ -274,7 +294,7 @@ pub async fn provision_single_runner(
                     "Failed to provision runner {} using template {}: {}",
                     runner.name, template_name, error_msg
                 );
-                ProvisionOutcome::Failed(error_msg)
+                ProvisionOutcome::failed(error_msg)
             }
         },
         Err(e) => {
@@ -283,7 +303,7 @@ pub async fn provision_single_runner(
                 "Failed to provision runner {} (registry lookup): {}",
                 runner.name, error_msg
             );
-            ProvisionOutcome::Failed(error_msg)
+            ProvisionOutcome::failed(error_msg)
         }
     };
 

@@ -37,7 +37,14 @@ pub enum ProvisionEvent {
     Succeeded { runner_name: String },
 
     /// Real provisioning failure (executor error, bad spec, network).
-    Failed { runner_name: String, error: String },
+    /// `diagnostics` is an open-ended structured bag that gets merged
+    /// into the upstream `AgentEvent.metadata` — meda's detached-exec
+    /// failure path uses it to attach SSH timing and VM-side state.
+    Failed {
+        runner_name: String,
+        error: String,
+        diagnostics: serde_json::Map<String, serde_json::Value>,
+    },
 
     /// Host admission control rejected the request (meda 503). Runner
     /// was never spawned; retry budget MUST be preserved.
@@ -62,9 +69,10 @@ impl From<ProvisionResult> for ProvisionEvent {
             ProvisionOutcome::Success => ProvisionEvent::Succeeded {
                 runner_name: pr.runner_name,
             },
-            ProvisionOutcome::Failed(error) => ProvisionEvent::Failed {
+            ProvisionOutcome::Failed { error, diagnostics } => ProvisionEvent::Failed {
                 runner_name: pr.runner_name,
                 error,
+                diagnostics,
             },
             ProvisionOutcome::HostFull {
                 code,
@@ -146,8 +154,17 @@ pub enum Severity {
 pub fn to_agent_event(ev: &ProvisionEvent, attempt: u32) -> Option<AgentEvent> {
     match ev {
         ProvisionEvent::Succeeded { .. } => None,
-        ProvisionEvent::Failed { runner_name, error } => {
-            let mut metadata = serde_json::Map::new();
+        ProvisionEvent::Failed {
+            runner_name,
+            error,
+            diagnostics,
+        } => {
+            // Start from the caller-provided diagnostics so the AgentEvent
+            // carries the structured root-cause hints (SSH timing,
+            // VM-side state). Then layer the canonical `attempt`/`error`
+            // keys on top — those two are guaranteed to be present so
+            // cirun-go's dispatch can rely on them.
+            let mut metadata = diagnostics.clone();
             metadata.insert("attempt".into(), serde_json::Value::from(attempt));
             metadata.insert("error".into(), serde_json::Value::from(error.clone()));
             Some(AgentEvent {
@@ -231,7 +248,7 @@ mod tests {
         ProvisionResult {
             runner_name: name.into(),
             executor_kind: None,
-            outcome: ProvisionOutcome::Failed(err.into()),
+            outcome: ProvisionOutcome::failed(err),
         }
     }
     fn pr_host_full(name: &str, code: &str) -> ProvisionResult {
@@ -280,6 +297,7 @@ mod tests {
         let ev = ProvisionEvent::Failed {
             runner_name: "r1".into(),
             error: "boom".into(),
+            diagnostics: serde_json::Map::new(),
         };
         let agent_event = to_agent_event(&ev, 3).expect("should emit");
         assert_eq!(agent_event.kind, EventKind::ProvisionFailed);
@@ -292,6 +310,66 @@ mod tests {
         assert_eq!(
             agent_event.metadata.get("error"),
             Some(&serde_json::Value::from("boom"))
+        );
+    }
+
+    #[test]
+    fn failed_event_carries_caller_supplied_diagnostics_into_metadata() {
+        // The whole point of the diagnostics field is that meda's
+        // detached-exec failure path can attach SSH timing + VM-side
+        // state; if that doesn't survive into the wire-format metadata
+        // we've lost the observability we built it for.
+        let mut diag = serde_json::Map::new();
+        diag.insert("elapsed_ms".into(), serde_json::Value::from(37386));
+        diag.insert("partial_stdout".into(), serde_json::Value::from("18066\n"));
+        diag.insert(
+            "vm_diagnostics".into(),
+            serde_json::Value::from("=== ps ===\n..."),
+        );
+        let ev = ProvisionEvent::Failed {
+            runner_name: "r1".into(),
+            error: "ssh exec timed out".into(),
+            diagnostics: diag,
+        };
+        let agent_event = to_agent_event(&ev, 1).expect("should emit");
+        assert_eq!(
+            agent_event.metadata.get("elapsed_ms"),
+            Some(&serde_json::Value::from(37386))
+        );
+        assert_eq!(
+            agent_event.metadata.get("partial_stdout"),
+            Some(&serde_json::Value::from("18066\n"))
+        );
+        assert!(agent_event
+            .metadata
+            .get("vm_diagnostics")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .contains("=== ps ==="));
+    }
+
+    #[test]
+    fn canonical_metadata_keys_override_caller_diagnostics() {
+        // cirun-go relies on `attempt` and `error` being canonical
+        // keys; if a caller stuffed conflicting values into the
+        // diagnostics bag, the canonical ones must still win so
+        // dispatch behaviour stays predictable.
+        let mut diag = serde_json::Map::new();
+        diag.insert("attempt".into(), serde_json::Value::from(99));
+        diag.insert("error".into(), serde_json::Value::from("wrong"));
+        let ev = ProvisionEvent::Failed {
+            runner_name: "r1".into(),
+            error: "real error".into(),
+            diagnostics: diag,
+        };
+        let agent_event = to_agent_event(&ev, 2).expect("should emit");
+        assert_eq!(
+            agent_event.metadata.get("attempt"),
+            Some(&serde_json::Value::from(2))
+        );
+        assert_eq!(
+            agent_event.metadata.get("error"),
+            Some(&serde_json::Value::from("real error"))
         );
     }
 

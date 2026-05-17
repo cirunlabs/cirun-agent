@@ -127,13 +127,13 @@ impl Executor for DockerExecutor {
                 name,
             ])
             .output()
-            .map_err(|e| ProvisionError::Transient(format!("docker inspect: {e}")))?;
+            .map_err(|e| ProvisionError::transient(format!("docker inspect: {e}")))?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             if is_docker_not_found(&stderr) {
                 return Ok(RunnerState::Absent);
             }
-            return Err(ProvisionError::Transient(format!(
+            return Err(ProvisionError::transient(format!(
                 "docker inspect failed: {}",
                 stderr
             )));
@@ -195,20 +195,20 @@ impl Executor for DockerExecutor {
         self.client
             .run_runner(&container_spec)
             .map(|_| ())
-            .map_err(|e| ProvisionError::Transient(format!("docker run failed: {e}")))
+            .map_err(|e| ProvisionError::transient(format!("docker run failed: {e}")))
     }
 
     async fn kill(&self, name: &str) -> Result<(), ProvisionError> {
         self.client
             .stop_and_remove(name)
-            .map_err(|e| ProvisionError::Transient(format!("docker rm: {e}")))
+            .map_err(|e| ProvisionError::transient(format!("docker rm: {e}")))
     }
 
     async fn list_owned(&self) -> Result<Vec<OwnedRunner>, ProvisionError> {
         let infos = self
             .client
             .list_runner_containers("cirun.runner=true")
-            .map_err(|e| ProvisionError::Transient(format!("docker ps: {e}")))?;
+            .map_err(|e| ProvisionError::transient(format!("docker ps: {e}")))?;
         Ok(infos
             .into_iter()
             .map(|i| OwnedRunner {

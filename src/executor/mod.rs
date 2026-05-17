@@ -156,9 +156,15 @@ pub struct OwnedRunner {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProvisionError {
-    /// Caller may retry.
-    #[error("transient: {0}")]
-    Transient(String),
+    /// Caller may retry. `diagnostics` is an open-ended JSON bag that
+    /// rides up the chain and lands in the `AgentEvent.metadata` cirun-go
+    /// receives — use it for structured root-cause hints (elapsed_ms,
+    /// partial SSH stdio, VM-side state captures).
+    #[error("transient: {message}")]
+    Transient {
+        message: String,
+        diagnostics: serde_json::Map<String, serde_json::Value>,
+    },
     /// Permanent runtime failure — do not retry. Constructed by the lume
     /// executor (macos-only); kept on linux for parity with the trait
     /// surface so callers can match exhaustively without cfg branches.
@@ -181,6 +187,33 @@ pub enum ProvisionError {
         message: String,
         retry_after_secs: u64,
     },
+}
+
+impl ProvisionError {
+    /// Build a transient error with no structured diagnostics — the
+    /// common case for callers that only have a human message. Use
+    /// `transient_with` when you've already gathered a metadata bag.
+    pub fn transient(msg: impl Into<String>) -> Self {
+        Self::Transient {
+            message: msg.into(),
+            diagnostics: serde_json::Map::new(),
+        }
+    }
+
+    /// Build a transient error with a structured diagnostics bag.
+    /// Meda's detached-exec failure path uses this to attach the SSH
+    /// timing + VM-side state capture so the cirun-go event log carries
+    /// enough context to root-cause the failure without an SSH shell.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn transient_with(
+        msg: impl Into<String>,
+        diagnostics: serde_json::Map<String, serde_json::Value>,
+    ) -> Self {
+        Self::Transient {
+            message: msg.into(),
+            diagnostics,
+        }
+    }
 }
 
 #[async_trait]
@@ -242,7 +275,7 @@ pub trait Executor: Send + Sync {
                 RunnerState::Starting => {
                     if tokio::time::Instant::now() >= deadline {
                         let _ = self.kill(&spec.name).await;
-                        return Err(ProvisionError::Transient(format!(
+                        return Err(ProvisionError::transient(format!(
                             "runner '{}' did not reach Healthy within {:?}",
                             spec.name,
                             self.settle_timeout()
@@ -254,13 +287,13 @@ pub trait Executor: Send + Sync {
                     last_logs,
                 } => {
                     let _ = self.kill(&spec.name).await;
-                    return Err(ProvisionError::Transient(format!(
+                    return Err(ProvisionError::transient(format!(
                         "runner '{}' exited (code={:?}) during settle: {}",
                         spec.name, exit_code, last_logs
                     )));
                 }
                 RunnerState::Absent => {
-                    return Err(ProvisionError::Transient(format!(
+                    return Err(ProvisionError::transient(format!(
                         "runner '{}' disappeared during settle",
                         spec.name
                     )));

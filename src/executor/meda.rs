@@ -1,6 +1,6 @@
 //! Meda adapter: wraps `crate::meda::client::MedaClient` behind the `Executor` trait.
 
-use super::{Executor, OwnedRunner, ProvisionError, RunnerLogin, RunnerSpec, RunnerState};
+use super::{Executor, OwnedRunner, ProvisionError, RunnerSpec, RunnerState};
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,7 +28,7 @@ pub struct MedaExecutor {
 impl MedaExecutor {
     pub fn new() -> Result<Self, ProvisionError> {
         let client = crate::meda::client::MedaClient::new()
-            .map_err(|e| ProvisionError::Transient(format!("meda init: {e}")))?;
+            .map_err(|e| ProvisionError::transient(format!("meda init: {e}")))?;
         Ok(Self {
             client: Arc::new(client),
         })
@@ -72,7 +72,7 @@ impl Executor for MedaExecutor {
                 message,
                 retry_after_secs,
             }),
-            Err(e) => Err(ProvisionError::Transient(format!("meda run_vm: {e:?}"))),
+            Err(e) => Err(ProvisionError::transient(format!("meda run_vm: {e:?}"))),
         }
     }
 
@@ -80,7 +80,7 @@ impl Executor for MedaExecutor {
         self.client
             .delete_vm(name)
             .await
-            .map_err(|e| ProvisionError::Transient(format!("meda delete_vm: {e:?}")))
+            .map_err(|e| ProvisionError::transient(format!("meda delete_vm: {e:?}")))
     }
 
     async fn list_owned(&self) -> Result<Vec<OwnedRunner>, ProvisionError> {
@@ -88,7 +88,7 @@ impl Executor for MedaExecutor {
             .client
             .list_vms()
             .await
-            .map_err(|e| ProvisionError::Transient(format!("meda list_vms: {e:?}")))?;
+            .map_err(|e| ProvisionError::transient(format!("meda list_vms: {e:?}")))?;
         Ok(vms
             .into_iter()
             .filter(|v| v.name.starts_with("cirun-"))
@@ -100,104 +100,49 @@ impl Executor for MedaExecutor {
     }
 
     /// After meda reports the VM "running", we still need to wait for DHCP +
-    /// SSH before the provision script can be pushed. That belongs here, not
-    /// in the trait's settle loop.
+    /// SSH before the provision script can be pushed. The actual
+    /// push-script + run-detached + diagnostic-capture lifecycle lives
+    /// in `crate::provision_push` so every SSH-based executor shares
+    /// the same kill-after-PID-read fix and the same structured
+    /// observability bag.
     async fn run_post_spawn(&self, spec: &RunnerSpec) -> Result<(), ProvisionError> {
+        use crate::ssh::{SshAuth, SshTarget};
         log::info!("Waiting for VM '{}' to get an IP address...", spec.name);
         let ip = self
             .client
             .wait_for_vm_ip(&spec.name, 300)
             .await
-            .map_err(|e| ProvisionError::Transient(format!("wait_for_vm_ip: {e:?}")))?;
+            .map_err(|e| ProvisionError::transient(format!("wait_for_vm_ip: {e:?}")))?;
         log::info!("VM '{}' has IP {}; pushing provision script", spec.name, ip);
 
-        push_provision_script_via_ssh(&spec.name, &ip, &spec.provision_script, &spec.login, true)
+        let home_dir = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        let target = SshTarget::new(
+            ip.clone(),
+            spec.login.username.clone(),
+            SshAuth::Key(std::path::PathBuf::from(format!(
+                "{home_dir}/.meda/ssh/id_ed25519"
+            ))),
+        )
+        .map_err(|e| ProvisionError::transient(format!("ssh target: {e}")))?;
+
+        let ctx = crate::provision_push::PushContext {
+            vm_name: &spec.name,
+            vm_ip: &ip,
+            target,
+            script: &spec.provision_script,
+            use_sudo: true,
+            detached_exec_timeout: Duration::from_secs(60),
+        };
+        crate::provision_push::push_and_run_detached(&ctx)
             .await
-            .map(|_| ())
-            .map_err(|e| ProvisionError::Transient(format!("provision script: {e}")))
+            .map(|_pid| ())
+            .map_err(|f| {
+                ProvisionError::transient_with(
+                    format!("provision script: {}", f.message),
+                    f.diagnostics,
+                )
+            })
     }
-}
-
-/// SSH the meda VM with its ed25519 key, scp the provision script, run it
-/// under `sudo bash`. Detached mode launches in background (short timeout);
-/// blocking mode waits up to 10 minutes for completion. Lives next to the
-/// `MedaExecutor` that owns the SSH-push lifecycle.
-async fn push_provision_script_via_ssh(
-    vm_name: &str,
-    ip_address: &str,
-    script_content: &str,
-    login: &RunnerLogin,
-    run_detached: bool,
-) -> Result<String, Box<dyn std::error::Error>> {
-    use crate::ssh::{copy_file, exec, test_connection, SshAuth, SshTarget};
-    use std::io::Write;
-    use std::time::Instant;
-    use tempfile::NamedTempFile;
-
-    log::info!("VM '{}' is ready with IP: {}", vm_name, ip_address);
-
-    let mut temp_file = NamedTempFile::new()?;
-    temp_file.write_all(script_content.as_bytes())?;
-
-    let home_dir = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    let target = SshTarget::new(
-        ip_address.to_string(),
-        login.username.clone(),
-        SshAuth::Key(std::path::PathBuf::from(format!(
-            "{}/.meda/ssh/id_ed25519",
-            home_dir
-        ))),
-    )?;
-
-    // Wait for SSH to be ready (VM may still be booting).
-    let max_retries = 6usize;
-    let mut last_err: Option<String> = None;
-    for attempt in 1..=max_retries {
-        match test_connection(&target).await {
-            Ok(()) => {
-                log::info!("✔ SSH ready (attempt {}/{})", attempt, max_retries);
-                last_err = None;
-                break;
-            }
-            Err(e) => {
-                last_err = Some(e.to_string());
-                if attempt < max_retries {
-                    log::info!("SSH not ready (attempt {}/{}): {}", attempt, max_retries, e);
-                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                }
-            }
-        }
-    }
-    if let Some(e) = last_err {
-        return Err(format!("SSH not reachable after {max_retries} retries: {e}").into());
-    }
-
-    let remote_path = format!("/tmp/script_{}.sh", Instant::now().elapsed().as_secs());
-    copy_file(&target, temp_file.path(), &remote_path)
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-
-    // meda scripts run with sudo. Detached: short launch timeout. Blocking: 10min.
-    let (timeout_secs, cmd) = if run_detached {
-        (
-            60u64,
-            crate::script_cmd::detached_provision_cmd(&remote_path, true),
-        )
-    } else {
-        (
-            600u64,
-            format!("chmod +x {p} && sudo bash {p}", p = remote_path),
-        )
-    };
-    let stdout = exec(
-        &target,
-        &cmd,
-        tokio::time::Duration::from_secs(timeout_secs),
-    )
-    .await
-    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-    log::info!("Script execution completed successfully.");
-    Ok(stdout)
 }
 
 #[cfg(test)]

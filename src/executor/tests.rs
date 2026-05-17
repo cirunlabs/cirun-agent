@@ -325,7 +325,7 @@ async fn provision_returns_transient_on_settle_timeout() {
     exec.settle_interval = Duration::from_millis(3);
     let err = exec.provision(&spec("r1")).await.unwrap_err();
     assert!(
-        matches!(err, ProvisionError::Transient(_)),
+        matches!(err, ProvisionError::Transient { .. }),
         "expected Transient, got {:?}",
         err
     );
@@ -347,7 +347,7 @@ async fn provision_returns_transient_when_terminated_during_settle() {
     ]);
     let err = exec.provision(&spec("r1")).await.unwrap_err();
     assert!(
-        matches!(err, ProvisionError::Transient(_)),
+        matches!(err, ProvisionError::Transient { .. }),
         "expected Transient, got {:?}",
         err
     );
