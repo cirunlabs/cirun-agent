@@ -29,6 +29,7 @@ impl DockerClient {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)] // Reserved for future tests that need a non-default docker binary path.
     pub fn with_bin(bin: impl Into<String>) -> Self {
         Self { bin: bin.into() }
     }

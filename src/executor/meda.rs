@@ -57,10 +57,23 @@ impl Executor for MedaExecutor {
             cpus: Some(spec.cpu),
             disk_size: Some(format!("{}G", spec.disk_gb)),
         };
-        self.client
-            .run_vm(req)
-            .await
-            .map_err(|e| ProvisionError::Transient(format!("meda run_vm: {e:?}")))
+        // Map admission-control 503s onto ProvisionError::HostFull so
+        // the provision flow can signal "at capacity" upstream without
+        // burning the runner's retry budget. Other meda errors are
+        // genuine failures and stay as Transient.
+        match self.client.run_vm(req).await {
+            Ok(()) => Ok(()),
+            Err(crate::meda::errors::MedaError::HostFull {
+                code,
+                message,
+                retry_after_secs,
+            }) => Err(ProvisionError::HostFull {
+                code,
+                message,
+                retry_after_secs,
+            }),
+            Err(e) => Err(ProvisionError::Transient(format!("meda run_vm: {e:?}"))),
+        }
     }
 
     async fn kill(&self, name: &str) -> Result<(), ProvisionError> {
@@ -168,10 +181,7 @@ async fn push_provision_script_via_ssh(
     let (timeout_secs, cmd) = if run_detached {
         (
             60u64,
-            format!(
-                "chmod +x {p} && sudo nohup bash {p} > /tmp/script_stdout.log 2> /tmp/script_stderr.log & echo $!",
-                p = remote_path
-            ),
+            crate::script_cmd::detached_provision_cmd(&remote_path, true),
         )
     } else {
         (

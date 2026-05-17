@@ -178,6 +178,51 @@ impl SshTarget {
     }
 }
 
+/// Run a remote command via SSH with a hard timeout. Captures stdout/stderr.
+pub async fn exec(target: &SshTarget, remote_cmd: &str, timeout: Duration) -> Result<String> {
+    let output = tokio::time::timeout(timeout, target.ssh_cmd(remote_cmd).output())
+        .await
+        .map_err(|_| anyhow!("SSH exec timed out after {:?}", timeout))?
+        .map_err(|e| anyhow!("SSH spawn error: {}", e))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "SSH exec failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Cheap connectivity probe: runs `echo` over SSH. Returns Ok if the connection works.
+pub async fn test_connection(target: &SshTarget) -> Result<()> {
+    exec(target, "echo SSH-OK", Duration::from_secs(30)).await?;
+    Ok(())
+}
+
+/// Copy a local file to the remote via SCP.
+pub async fn copy_file(target: &SshTarget, local: &Path, remote: &str) -> Result<()> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(60),
+        target.scp_cmd(local, remote).output(),
+    )
+    .await
+    .map_err(|_| anyhow!("SCP transfer timed out after 60s"))?
+    .map_err(|e| anyhow!("SCP spawn error: {}", e))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "SCP failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    info!(
+        "✔ SCP transferred {:?} -> {}:{}",
+        local,
+        target.destination(),
+        remote
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,49 +290,4 @@ mod tests {
         );
         assert!(r.is_ok());
     }
-}
-
-/// Run a remote command via SSH with a hard timeout. Captures stdout/stderr.
-pub async fn exec(target: &SshTarget, remote_cmd: &str, timeout: Duration) -> Result<String> {
-    let output = tokio::time::timeout(timeout, target.ssh_cmd(remote_cmd).output())
-        .await
-        .map_err(|_| anyhow!("SSH exec timed out after {:?}", timeout))?
-        .map_err(|e| anyhow!("SSH spawn error: {}", e))?;
-    if !output.status.success() {
-        return Err(anyhow!(
-            "SSH exec failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
-}
-
-/// Cheap connectivity probe: runs `echo` over SSH. Returns Ok if the connection works.
-pub async fn test_connection(target: &SshTarget) -> Result<()> {
-    exec(target, "echo SSH-OK", Duration::from_secs(30)).await?;
-    Ok(())
-}
-
-/// Copy a local file to the remote via SCP.
-pub async fn copy_file(target: &SshTarget, local: &Path, remote: &str) -> Result<()> {
-    let output = tokio::time::timeout(
-        Duration::from_secs(60),
-        target.scp_cmd(local, remote).output(),
-    )
-    .await
-    .map_err(|_| anyhow!("SCP transfer timed out after 60s"))?
-    .map_err(|e| anyhow!("SCP spawn error: {}", e))?;
-    if !output.status.success() {
-        return Err(anyhow!(
-            "SCP failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    info!(
-        "✔ SCP transferred {:?} -> {}:{}",
-        local,
-        target.destination(),
-        remote
-    );
-    Ok(())
 }
