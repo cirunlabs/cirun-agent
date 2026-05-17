@@ -243,6 +243,21 @@ pub async fn provision_single_runner(
         }
     };
 
+    // Docker-only flags from `.cirun.yml`'s extra_config. Missing /
+    // wrong-typed → false (current default behaviour).
+    let docker_privileged = runner
+        .extra_config
+        .as_ref()
+        .and_then(|v| v.get("privileged"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let docker_mount_socket = runner
+        .extra_config
+        .as_ref()
+        .and_then(|v| v.get("docker_socket_mount"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     let spec = crate::executor::RunnerSpec {
         name: runner.name.clone(),
         provision_script: runner.provision_script.clone(),
@@ -251,6 +266,8 @@ pub async fn provision_single_runner(
         memory_gb: resources.memory,
         disk_gb: resources.disk,
         gpu,
+        docker_privileged,
+        docker_mount_socket,
         login: crate::executor::RunnerLogin {
             username: runner.login.username.clone(),
             password: runner.login.password.clone(),

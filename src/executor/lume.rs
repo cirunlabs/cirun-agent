@@ -172,6 +172,8 @@ mod tests {
             memory_gb: 4,
             disk_gb: 20,
             gpu,
+            docker_privileged: false,
+            docker_mount_socket: false,
             login: crate::executor::RunnerLogin {
                 username: "u".into(),
                 password: "p".into(),

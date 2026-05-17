@@ -130,6 +130,13 @@ pub struct RunnerSpec {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub disk_gb: u32,
     pub gpu: GpuRequest,
+    /// Docker-only: pass `--privileged` to `docker run`. Surfaces from
+    /// `.cirun.yml` as `extra_config.privileged: true`. Meda/lume ignore.
+    pub docker_privileged: bool,
+    /// Docker-only: bind `/var/run/docker.sock` from the host into the
+    /// container. Surfaces from `.cirun.yml` as
+    /// `extra_config.docker_socket_mount: true`.
+    pub docker_mount_socket: bool,
     pub login: RunnerLogin,
 }
 

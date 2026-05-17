@@ -191,6 +191,8 @@ impl Executor for DockerExecutor {
             memory_gb: Some(spec.memory_gb),
             env: vec![("CIRUN_RUNNER_NAME".into(), spec.name.clone())],
             command: ContainerCommand::Script(spec.provision_script.clone()),
+            privileged: spec.docker_privileged,
+            mount_docker_socket: spec.docker_mount_socket,
         };
         self.client
             .run_runner(&container_spec)
@@ -300,6 +302,8 @@ mod tests {
             memory_gb: 4,
             disk_gb: 20,
             gpu: GpuRequest::None,
+            docker_privileged: false,
+            docker_mount_socket: false,
             login: crate::executor::RunnerLogin {
                 username: "u".into(),
                 password: "p".into(),

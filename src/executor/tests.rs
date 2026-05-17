@@ -71,6 +71,8 @@ fn spec(name: &str) -> RunnerSpec {
         memory_gb: 4,
         disk_gb: 20,
         gpu: GpuRequest::None,
+        docker_privileged: false,
+        docker_mount_socket: false,
         login: RunnerLogin {
             username: "runner".into(),
             password: "p".into(),

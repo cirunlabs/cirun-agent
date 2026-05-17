@@ -42,11 +42,31 @@ impl DockerClient {
         argv.push("--name".into());
         argv.push(spec.name.clone());
 
+        // Make GitHub Actions' "Machine name" show the runner name
+        // instead of the 12-char container-id hash. Linux hostname is
+        // capped at 63 bytes (RFC 1035 label limit); truncate so a
+        // future longer runner-name pattern doesn't break `docker run`.
+        argv.push("--hostname".into());
+        argv.push(spec.name.chars().take(63).collect());
+
         // `cirun.runner=true` is how `list_owned` finds our containers. Every
         // cirun-spawned container MUST carry it — without it the runner is
         // invisible to the registry, max_vms cap, and orphan cleanup.
         argv.push("--label".into());
         argv.push("cirun.runner=true".into());
+
+        // Docker daemon access flags. Both default off; the runner-only
+        // mode that results is what the cirun-docker-runner-image
+        // README documents as the default. .cirun.yml opts in:
+        //   extra_config.privileged: true            → DinD
+        //   extra_config.docker_socket_mount: true   → out-of-docker
+        if spec.privileged {
+            argv.push("--privileged".into());
+        }
+        if spec.mount_docker_socket {
+            argv.push("-v".into());
+            argv.push("/var/run/docker.sock:/var/run/docker.sock".into());
+        }
 
         match spec.gpus {
             GpuSelection::All => {
@@ -216,7 +236,49 @@ mod tests {
             memory_gb: None,
             env: vec![],
             command: cmd,
+            privileged: false,
+            mount_docker_socket: false,
         }
+    }
+
+    #[test]
+    fn run_argv_privileged_emits_flag() {
+        let mut s = spec(
+            "r1",
+            "ubuntu:24.04",
+            GpuSelection::None,
+            ContainerCommand::Argv(vec!["true".into()]),
+        );
+        s.privileged = true;
+        let argv = DockerClient::build_run_argv(&s);
+        assert!(argv.contains(&"--privileged".to_string()));
+    }
+
+    #[test]
+    fn run_argv_docker_socket_emits_volume_mount() {
+        let mut s = spec(
+            "r1",
+            "ubuntu:24.04",
+            GpuSelection::None,
+            ContainerCommand::Argv(vec!["true".into()]),
+        );
+        s.mount_docker_socket = true;
+        let argv = DockerClient::build_run_argv(&s);
+        let pos = argv.iter().position(|a| a == "-v").expect("missing -v");
+        assert_eq!(argv[pos + 1], "/var/run/docker.sock:/var/run/docker.sock");
+    }
+
+    #[test]
+    fn run_argv_defaults_omit_both_flags() {
+        let s = spec(
+            "r1",
+            "ubuntu:24.04",
+            GpuSelection::None,
+            ContainerCommand::Argv(vec!["true".into()]),
+        );
+        let argv = DockerClient::build_run_argv(&s);
+        assert!(!argv.iter().any(|a| a == "--privileged"));
+        assert!(!argv.iter().any(|a| a == "-v"));
     }
 
     #[test]
@@ -236,6 +298,8 @@ mod tests {
                 "--restart=no",
                 "--name",
                 "r1",
+                "--hostname",
+                "r1",
                 "--label",
                 "cirun.runner=true",
                 "ubuntu:24.04",
@@ -243,6 +307,44 @@ mod tests {
                 "hi"
             ]
         );
+    }
+
+    #[test]
+    fn run_argv_sets_hostname_to_runner_name() {
+        // GitHub Actions reads the container hostname as "Machine name"
+        // in the Set up job step; defaulting to the docker-assigned
+        // 12-char container-id hash made job logs uninformative.
+        let s = spec(
+            "cirun-aktech--demo-abc123",
+            "ubuntu:24.04",
+            GpuSelection::None,
+            ContainerCommand::Argv(vec!["true".into()]),
+        );
+        let argv = DockerClient::build_run_argv(&s);
+        let pos = argv
+            .iter()
+            .position(|a| a == "--hostname")
+            .expect("missing --hostname");
+        assert_eq!(argv[pos + 1], "cirun-aktech--demo-abc123");
+    }
+
+    #[test]
+    fn run_argv_truncates_hostname_to_63_chars() {
+        // Linux hostnames are capped at 63 bytes (RFC 1035 label
+        // limit); docker run rejects longer values with an error.
+        let long_name: String = "x".repeat(120);
+        let s = spec(
+            &long_name,
+            "ubuntu:24.04",
+            GpuSelection::None,
+            ContainerCommand::Argv(vec!["true".into()]),
+        );
+        let argv = DockerClient::build_run_argv(&s);
+        let pos = argv
+            .iter()
+            .position(|a| a == "--hostname")
+            .expect("missing --hostname");
+        assert_eq!(argv[pos + 1].len(), 63);
     }
 
     /// Every cirun-spawned container MUST carry `cirun.runner=true` — the
