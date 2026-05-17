@@ -10,6 +10,7 @@ mod lume;
 mod meda;
 mod provision;
 mod reporting;
+mod script_cmd;
 mod service;
 mod ssh;
 #[cfg(target_os = "macos")]

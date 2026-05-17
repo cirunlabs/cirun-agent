@@ -181,10 +181,7 @@ async fn push_provision_script_via_ssh(
     let (timeout_secs, cmd) = if run_detached {
         (
             60u64,
-            format!(
-                "chmod +x {p} && sudo nohup bash {p} > /tmp/script_stdout.log 2> /tmp/script_stderr.log & echo $!",
-                p = remote_path
-            ),
+            crate::script_cmd::detached_provision_cmd(&remote_path, true),
         )
     } else {
         (
