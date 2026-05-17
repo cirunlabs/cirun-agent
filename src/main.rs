@@ -9,6 +9,7 @@ mod lume;
 #[cfg(target_os = "linux")]
 mod meda;
 mod provision;
+mod provision_push;
 mod reporting;
 mod script_cmd;
 mod service;

@@ -33,7 +33,7 @@ pub struct LumeExecutor {
 impl LumeExecutor {
     pub fn new() -> Result<Self, ProvisionError> {
         let client = crate::lume::client::LumeClient::new()
-            .map_err(|e| ProvisionError::Transient(format!("lume init: {e}")))?;
+            .map_err(|e| ProvisionError::transient(format!("lume init: {e}")))?;
         Ok(Self {
             client: Arc::new(client),
         })
@@ -74,7 +74,7 @@ impl Executor for LumeExecutor {
         self.client
             .clone_vm(&spec.image, &spec.name)
             .await
-            .map_err(|e| ProvisionError::Transient(format!("lume clone_vm: {e:?}")))?;
+            .map_err(|e| ProvisionError::transient(format!("lume clone_vm: {e:?}")))?;
         let run_config = RunConfig {
             no_display: Some(true),
             shared_directories: None,
@@ -83,7 +83,7 @@ impl Executor for LumeExecutor {
         self.client
             .run_vm(&spec.name, Some(run_config))
             .await
-            .map_err(|e| ProvisionError::Transient(format!("lume run_vm: {e:?}")))?;
+            .map_err(|e| ProvisionError::transient(format!("lume run_vm: {e:?}")))?;
         // Block until the daemon shows the VM has left `stopped`. The xcode
         // image is larger and slower to start than vanilla — 30s wasn't
         // enough on m1 (observed 2026-05-15). 120s is generous; actual boot
@@ -97,7 +97,7 @@ impl Executor for LumeExecutor {
                 Err(e) => log::debug!("lume get_vm during spawn-wait: {e:?}"),
             }
             if tokio::time::Instant::now() >= deadline {
-                return Err(ProvisionError::Transient(format!(
+                return Err(ProvisionError::transient(format!(
                     "lume VM '{}' did not leave 'stopped' state within 120s of run_vm",
                     spec.name
                 )));
@@ -109,7 +109,7 @@ impl Executor for LumeExecutor {
         self.client
             .delete_vm(name)
             .await
-            .map_err(|e| ProvisionError::Transient(format!("lume delete_vm: {e:?}")))
+            .map_err(|e| ProvisionError::transient(format!("lume delete_vm: {e:?}")))
     }
 
     async fn list_owned(&self) -> Result<Vec<OwnedRunner>, ProvisionError> {
@@ -117,7 +117,7 @@ impl Executor for LumeExecutor {
             .client
             .list_vms()
             .await
-            .map_err(|e| ProvisionError::Transient(format!("lume list_vms: {e:?}")))?;
+            .map_err(|e| ProvisionError::transient(format!("lume list_vms: {e:?}")))?;
         Ok(vms
             .into_iter()
             .filter(|v| v.name.starts_with("cirun-"))
@@ -142,7 +142,7 @@ impl Executor for LumeExecutor {
         )
         .await
         .map(|_| ())
-        .map_err(|e| ProvisionError::Transient(format!("provision script: {e}")))
+        .map_err(|e| ProvisionError::transient(format!("provision script: {e}")))
     }
 }
 

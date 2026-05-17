@@ -56,11 +56,7 @@ pub async fn run_script_on_vm(
 
     use crate::ssh::{copy_file, exec, test_connection, SshAuth, SshTarget};
 
-    info!("Creating temporary script file");
-    let mut temp_file = NamedTempFile::new()?;
-    temp_file.write_all(script_content.as_bytes())?;
-
-    // password_tmp must outlive the target (dropped on function exit auto-deletes).
+    // password_tmp must outlive the SshTarget (dropped on function exit auto-deletes).
     let password_tmp = create_password_file(password)?;
     info!(
         "SSH target: {}@{} (password auth, password length={})",
@@ -73,6 +69,32 @@ pub async fn run_script_on_vm(
         username.to_string(),
         SshAuth::PasswordFile(password_tmp.path().to_path_buf()),
     )?;
+
+    // Detached path is shared with meda via `provision_push` so both
+    // SSH-based executors get the same kill-after-PID-read fix and
+    // the same structured-diagnostics observability bag. The blocking
+    // path (run_detached=false) stays inline — it owns the 10-minute
+    // "wait for the script to complete" lifetime which the shared
+    // module deliberately does not handle.
+    if run_detached {
+        let ctx = crate::provision_push::PushContext {
+            vm_name,
+            vm_ip: &ip_address,
+            target,
+            script: script_content,
+            use_sudo: false, // lume's macOS template user is already admin
+            detached_exec_timeout: Duration::from_secs(60),
+        };
+        let pid = crate::provision_push::push_and_run_detached(&ctx)
+            .await
+            .map_err(|f| -> Box<dyn std::error::Error> { f.message.into() })?;
+        drop(password_tmp);
+        return Ok(format!("{pid}\n"));
+    }
+
+    info!("Creating temporary script file");
+    let mut temp_file = NamedTempFile::new()?;
+    temp_file.write_all(script_content.as_bytes())?;
 
     // Test SSH (VM may still be booting). Use backon for exponential retry.
     (|| async { test_connection(&target).await })
@@ -96,22 +118,14 @@ pub async fn run_script_on_vm(
     .notify(|err, dur| warn!("Retrying SCP transfer after {:?}: {:?}", dur, err))
     .await?;
 
-    // Execute. Detached: short launch timeout. Blocking: 10min.
-    let (timeout_secs, cmd) = if run_detached {
-        (
-            60u64,
-            crate::script_cmd::detached_provision_cmd(&remote_script_path, false),
-        )
-    } else {
-        (
-            600u64,
-            format!("chmod +x {p} && {p}", p = remote_script_path),
-        )
-    };
+    // Blocking path: run the script foreground, wait up to 10 minutes
+    // for it to finish, return its stdout. Used by lume template
+    // creation today, not by per-runner provision.
+    let cmd = format!("chmod +x {p} && {p}", p = remote_script_path);
     let script_output = (|| {
         let target = &target;
         let cmd = cmd.clone();
-        async move { exec(target, &cmd, tokio::time::Duration::from_secs(timeout_secs)).await }
+        async move { exec(target, &cmd, tokio::time::Duration::from_secs(600)).await }
     })
     .retry(ExponentialBuilder::default().with_max_times(3))
     .sleep(tokio::time::sleep)

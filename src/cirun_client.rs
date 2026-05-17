@@ -400,6 +400,7 @@ impl CirunClient {
                     self.report(crate::reporting::ProvisionEvent::Failed {
                         runner_name: runner.name.clone(),
                         error: format!("Exceeded max retries ({})", runner.max_retries),
+                        diagnostics: serde_json::Map::new(),
                     })
                     .await;
                 }
