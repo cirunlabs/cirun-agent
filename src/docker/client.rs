@@ -51,7 +51,7 @@ impl DockerClient {
 
         // `cirun.runner=true` is how `list_owned` finds our containers. Every
         // cirun-spawned container MUST carry it — without it the runner is
-        // invisible to the registry, max_vms cap, and orphan cleanup.
+        // invisible to the registry, max_runners cap, and orphan cleanup.
         argv.push("--label".into());
         argv.push("cirun.runner=true".into());
 
@@ -349,7 +349,7 @@ mod tests {
 
     /// Every cirun-spawned container MUST carry `cirun.runner=true` — the
     /// agent's `list_owned` filters by this label, so without it docker
-    /// runners are invisible to the registry, the max_vms cap, and the
+    /// runners are invisible to the registry, the max_runners cap, and the
     /// orphan-cleanup path.
     #[test]
     fn run_argv_always_stamps_cirun_runner_label() {

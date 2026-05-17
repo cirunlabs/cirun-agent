@@ -96,7 +96,7 @@ For more details, checkout docs: https://docs.cirun.io/on-prem
 | `--id-file` | `-f` | Agent ID file path | .agent_id |
 | `--verbose` | `-v` | Enable verbose logging | false |
 | `--install-service` | | Install as system service | false |
-| `--max-vms` | | Maximum concurrent VMs (min: 1) | 2 (macOS), unlimited (Linux) |
+| `--max-runners` | | Maximum concurrent runners — VMs or containers (min: 1). Old alias: `--max-vms`. | 2 (macOS), unlimited (Linux) |
 
 ## 🔌 Virtualization
 
@@ -124,20 +124,21 @@ cirun-agent --interval 30
 2. Configure it with your required tools and settings
 3. Start the agent - it will clone this template when provisioning new runners
 
-### Limiting Concurrent VMs
+### Limiting Concurrent Runners
 
-Control the maximum number of VMs running simultaneously:
+Control the maximum number of runners (VMs or containers) running
+simultaneously:
 
 ```bash
-# Limit to 5 concurrent VMs (useful for resource management)
+# Limit to 5 concurrent runners (useful for resource management)
 export CIRUN_API_TOKEN=YOUR_TOKEN
-cirun-agent --max-vms 5
+cirun-agent --max-runners 5
 
-# macOS automatically defaults to 2 VMs (Apple Virtualization Framework limit)
+# macOS automatically defaults to 2 runners (Apple Virtualization framework limit on lume VMs)
 # Linux has no default limit unless specified
 ```
 
-**Note**: On macOS, the Apple Virtualization Framework limits concurrent VMs to 2, so the agent defaults to `--max-vms 2` automatically.
+**Note**: On macOS, the Apple Virtualization framework caps concurrent VMs at 2 on most hardware, so the agent defaults to `--max-runners 2` automatically. `--max-vms` is kept as a deprecated alias for backward compatibility.
 
 ## 🏗️ Architecture
 

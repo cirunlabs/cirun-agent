@@ -28,7 +28,7 @@ pub struct CirunClient {
     /// `try_join_next` drain).
     pub retry_tracker: std::sync::Mutex<HashMap<String, u32>>,
     /// None means no limit, Some(n) means max n concurrent VMs
-    max_vms: Option<u32>,
+    max_runners: Option<u32>,
     /// Per-runner executor binding, learned at provision time. Cleanup/delete
     /// paths consult this map instead of guessing from env vars.
     /// Mutex (not just inner map) because lookups happen behind `&self` and
@@ -45,7 +45,12 @@ pub struct CirunClient {
 }
 
 impl CirunClient {
-    pub fn new(base_url: &str, api_token: &str, agent: AgentInfo, max_vms: Option<u32>) -> Self {
+    pub fn new(
+        base_url: &str,
+        api_token: &str,
+        agent: AgentInfo,
+        max_runners: Option<u32>,
+    ) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(15))
             .connect_timeout(Duration::from_secs(10))
@@ -58,7 +63,7 @@ impl CirunClient {
             api_token: api_token.to_string(),
             agent,
             retry_tracker: std::sync::Mutex::new(HashMap::new()),
-            max_vms,
+            max_runners,
             runner_executors: std::sync::Mutex::new(HashMap::new()),
             in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             registry: Arc::new(crate::executor::registry::Registry::probe()),
@@ -467,19 +472,19 @@ impl CirunClient {
                 .collect();
 
             if !eligible_runners.is_empty() {
-                // Calculate available slots based on VM capacity
-                let available_slots = if let Some(max_vms) = self.max_vms {
+                // Calculate available slots based on runner capacity
+                let available_slots = if let Some(max_runners) = self.max_runners {
                     let running_count = self.registry.total_count_running().await;
-                    let slots = (max_vms as usize).saturating_sub(running_count);
+                    let slots = (max_runners as usize).saturating_sub(running_count);
                     info!(
-                        "VM capacity: {}/{} running, {} slots available, {} runners requested",
+                        "Runner capacity: {}/{} running, {} slots available, {} requested",
                         running_count,
-                        max_vms,
+                        max_runners,
                         slots,
                         eligible_runners.len()
                     );
                     if slots == 0 {
-                        info!("No VM slots available. Runners will be picked up on next poll.");
+                        info!("No runner slots available. Runners will be picked up on next poll.");
                     }
                     slots
                 } else {
@@ -622,7 +627,7 @@ mod tests {
                 arch: "x86_64".into(),
             },
             retry_tracker: std::sync::Mutex::new(HashMap::new()),
-            max_vms: None,
+            max_runners: None,
             runner_executors: std::sync::Mutex::new(HashMap::new()),
             in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             registry,

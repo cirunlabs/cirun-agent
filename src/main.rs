@@ -83,9 +83,13 @@ struct Args {
     #[arg(long)]
     uninstall_service: bool,
 
-    /// Maximum number of concurrent VMs (required on macOS due to Apple Virtualization Framework limit of 2)
-    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
-    max_vms: Option<u32>,
+    /// Maximum number of concurrent runners the agent will run (VMs or
+    /// containers, depending on the executor). On macOS, the Apple
+    /// Virtualization framework caps concurrent VMs at 2 on most hardware,
+    /// so the lume executor defaults to 2 if unset. `--max-vms` is kept as
+    /// a deprecated alias.
+    #[arg(long, alias = "max-vms", value_parser = clap::value_parser!(u32).range(1..))]
+    max_runners: Option<u32>,
 
     /// Run a docker GPU smoke test (`docker run --rm --gpus all <image> nvidia-smi`) and exit.
     /// Use to verify nvidia-container-toolkit + GPU passthrough on the host.
@@ -97,7 +101,7 @@ struct Args {
     docker_smoke_image: String,
 }
 
-const MACOS_DEFAULT_MAX_VMS: u32 = 2;
+const MACOS_DEFAULT_MAX_RUNNERS: u32 = 2;
 
 use bootstrap::{check_sshpass_installed, get_agent_info};
 
@@ -186,24 +190,24 @@ async fn main() {
     };
     info!("Cirun API URL: {}", cirun_api_url);
 
-    // Determine effective max_vms:
+    // Determine effective max_runners:
     // - If explicitly provided, use that value
-    // - On macOS: default to 2 (Apple Virtualization Framework limit)
+    // - On macOS: default to 2 (Apple Virtualization framework limit on lume VMs)
     // - On Linux: no limit (None)
-    let max_vms = args.max_vms.or(match env::consts::OS {
-        "macos" => Some(MACOS_DEFAULT_MAX_VMS),
+    let max_runners = args.max_runners.or(match env::consts::OS {
+        "macos" => Some(MACOS_DEFAULT_MAX_RUNNERS),
         _ => None, // No default limit on Linux
     });
-    match max_vms {
-        Some(limit) => info!("Max concurrent VMs: {}", limit),
-        None => info!("Max concurrent VMs: unlimited"),
+    match max_runners {
+        Some(limit) => info!("Max concurrent runners: {}", limit),
+        None => info!("Max concurrent runners: unlimited"),
     }
 
     let api_token = args
         .api_token
         .as_ref()
         .expect("API token is required when not installing or uninstalling service");
-    let mut client = CirunClient::new(&cirun_api_url, api_token, agent_info, max_vms);
+    let mut client = CirunClient::new(&cirun_api_url, api_token, agent_info, max_runners);
 
     // Set up log cleanup parameters based on platform
     let home_dir = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
