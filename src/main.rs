@@ -50,10 +50,15 @@ const CIRUN_BANNER: &str = r#"
 #[derive(Parser, Debug)]
 #[command(version, about = "Cirun Agent", long_about = None)]
 struct Args {
-    /// API token for authentication
+    /// API token for authentication. Can also be set via the
+    /// `CIRUN_API_TOKEN` env var — preferred for CI / docker contexts
+    /// where the secret would otherwise appear in argv and be visible
+    /// to `ps`, `set -x` shell traces, and process-table inspection.
     #[arg(
         short,
         long,
+        env = "CIRUN_API_TOKEN",
+        hide_env_values = true,
         required_unless_present_any = ["uninstall_service", "docker_smoke_test"],
     )]
     api_token: Option<String>,
