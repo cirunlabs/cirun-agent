@@ -380,3 +380,178 @@ async fn provision_reaps_then_spawns_when_terminated() {
         "must spawn fresh runner"
     );
 }
+
+// ── executor_serves_os: which runner OS each executor can produce ──
+//
+// Regression coverage for issue #14 — Docker on macOS must serve linux
+// runners (Docker Desktop runs linux containers on a mac host). The old
+// gate compared runner.os to agent.os and silently dropped these jobs.
+
+#[test]
+fn docker_serves_linux_runners() {
+    assert!(executor_serves_os(ExecutorKind::Docker, "linux"));
+}
+
+#[test]
+fn docker_rejects_macos_runners() {
+    // Docker cannot produce macOS containers, regardless of host OS.
+    assert!(!executor_serves_os(ExecutorKind::Docker, "macos"));
+}
+
+#[test]
+fn meda_serves_only_linux() {
+    assert!(executor_serves_os(ExecutorKind::Meda, "linux"));
+    assert!(!executor_serves_os(ExecutorKind::Meda, "macos"));
+}
+
+#[test]
+fn lume_serves_only_macos() {
+    assert!(executor_serves_os(ExecutorKind::Lume, "macos"));
+    assert!(!executor_serves_os(ExecutorKind::Lume, "linux"));
+}
+
+#[test]
+fn executor_serves_os_is_case_insensitive() {
+    assert!(executor_serves_os(ExecutorKind::Docker, "LINUX"));
+    assert!(executor_serves_os(ExecutorKind::Lume, "macOS"));
+}
+
+// ── parse_executor_filter: --executors <list> flag (issue #15) ──
+
+#[test]
+fn parse_executor_filter_single_value() {
+    let f = parse_executor_filter(Some("docker")).unwrap();
+    assert!(f.allows(ExecutorKind::Docker));
+    assert!(!f.allows(ExecutorKind::Meda));
+    assert!(!f.allows(ExecutorKind::Lume));
+}
+
+#[test]
+fn parse_executor_filter_comma_list() {
+    let f = parse_executor_filter(Some("docker,meda")).unwrap();
+    assert!(f.allows(ExecutorKind::Docker));
+    assert!(f.allows(ExecutorKind::Meda));
+    assert!(!f.allows(ExecutorKind::Lume));
+}
+
+#[test]
+fn parse_executor_filter_trims_and_ignores_blank_segments() {
+    let f = parse_executor_filter(Some(" docker , , meda ")).unwrap();
+    assert!(f.allows(ExecutorKind::Docker));
+    assert!(f.allows(ExecutorKind::Meda));
+    assert!(!f.allows(ExecutorKind::Lume));
+}
+
+#[test]
+fn parse_executor_filter_case_insensitive() {
+    let f = parse_executor_filter(Some("DOCKER,Lume")).unwrap();
+    assert!(f.allows(ExecutorKind::Docker));
+    assert!(f.allows(ExecutorKind::Lume));
+    assert!(!f.allows(ExecutorKind::Meda));
+}
+
+#[test]
+fn parse_executor_filter_unknown_value_errors() {
+    assert!(parse_executor_filter(Some("kata")).is_err());
+    assert!(parse_executor_filter(Some("docker,podman")).is_err());
+}
+
+#[test]
+fn parse_executor_filter_all_blank_errors() {
+    assert!(parse_executor_filter(Some(",, ,")).is_err());
+}
+
+// ── ExecutorKind metadata (Candidate 1: deepen the kind) ──
+//
+// One source of truth per kind for: wire name, runner OS produced, and
+// default-when-no-executor-specified. Locks every iteration over kinds
+// through `ALL` so adding a new variant breaks compilation if its
+// metadata is missed.
+
+#[test]
+fn executor_kind_all_lists_every_variant() {
+    // Updating this assertion is the signal that a new ExecutorKind was
+    // added and ALL must be extended.
+    assert_eq!(ExecutorKind::ALL.len(), 3);
+    assert!(ExecutorKind::ALL.contains(&ExecutorKind::Docker));
+    assert!(ExecutorKind::ALL.contains(&ExecutorKind::Meda));
+    assert!(ExecutorKind::ALL.contains(&ExecutorKind::Lume));
+}
+
+#[test]
+fn executor_kind_name_roundtrips_through_from_name() {
+    for kind in ExecutorKind::ALL {
+        assert_eq!(ExecutorKind::from_name(kind.name()).unwrap(), *kind);
+    }
+}
+
+#[test]
+fn executor_kind_from_name_is_case_and_whitespace_insensitive() {
+    assert_eq!(
+        ExecutorKind::from_name("  DOCKER  ").unwrap(),
+        ExecutorKind::Docker
+    );
+}
+
+#[test]
+fn executor_kind_from_name_rejects_unknown() {
+    assert!(ExecutorKind::from_name("podman").is_err());
+}
+
+#[test]
+fn executor_kind_produced_os_matches_serves_os() {
+    // The free function `executor_serves_os` is now defined in terms of
+    // `produced_os`; this guards the equivalence so the helper can never
+    // drift from the underlying metadata.
+    for kind in ExecutorKind::ALL {
+        assert!(executor_serves_os(*kind, kind.produced_os()));
+    }
+}
+
+#[test]
+fn executor_kind_default_for_host_os() {
+    assert_eq!(
+        ExecutorKind::default_for_host_os("linux"),
+        Some(ExecutorKind::Meda)
+    );
+    assert_eq!(
+        ExecutorKind::default_for_host_os("macos"),
+        Some(ExecutorKind::Lume)
+    );
+    assert_eq!(ExecutorKind::default_for_host_os("freebsd"), None);
+}
+
+// ── ExecutorFilter (Candidate 1: consolidate the `allows` closure) ──
+
+#[test]
+fn executor_filter_allow_all_admits_every_kind() {
+    let f = ExecutorFilter::allow_all();
+    for kind in ExecutorKind::ALL {
+        assert!(f.allows(*kind), "allow_all must admit {kind:?}");
+    }
+}
+
+#[test]
+fn executor_filter_allow_only_admits_listed_kinds() {
+    let mut set = std::collections::HashSet::new();
+    set.insert(ExecutorKind::Docker);
+    let f = ExecutorFilter::allow_only(set);
+    assert!(f.allows(ExecutorKind::Docker));
+    assert!(!f.allows(ExecutorKind::Meda));
+    assert!(!f.allows(ExecutorKind::Lume));
+}
+
+#[test]
+fn parse_executor_filter_returns_allow_all_when_unset() {
+    let f = parse_executor_filter(None).unwrap();
+    for kind in ExecutorKind::ALL {
+        assert!(f.allows(*kind));
+    }
+}
+
+#[test]
+fn parse_executor_filter_returns_allow_only_when_listed() {
+    let f = parse_executor_filter(Some("docker")).unwrap();
+    assert!(f.allows(ExecutorKind::Docker));
+    assert!(!f.allows(ExecutorKind::Meda));
+}

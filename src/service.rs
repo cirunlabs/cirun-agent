@@ -22,6 +22,9 @@ pub fn install(args: &Args) {
     if args.verbose {
         cmd.push_str(" --verbose");
     }
+    if let Some(execs) = args.executors.as_ref() {
+        cmd.push_str(&format!(" --executors {}", execs));
+    }
 
     if cfg!(target_os = "linux") {
         let service_path = "/etc/systemd/system/cirun-agent.service";
@@ -109,7 +112,7 @@ WantedBy=multi-user.target
         <string>{}</string>
         <string>--interval</string>
         <string>{}</string>
-{}    </array>
+{}{}    </array>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
@@ -133,6 +136,13 @@ WantedBy=multi-user.target
                 "        <string>--verbose</string>\n"
             } else {
                 ""
+            },
+            match args.executors.as_ref() {
+                Some(execs) => format!(
+                    "        <string>--executors</string>\n        <string>{}</string>\n",
+                    execs
+                ),
+                None => String::new(),
             },
             home_dir,
             home_dir

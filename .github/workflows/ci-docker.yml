@@ -1,0 +1,158 @@
+name: ci-docker
+
+# Verifies cargo build + test + lint on both Linux and macOS with a real
+# docker daemon reachable. The macOS leg is the one that matters here:
+# issue #14 was specifically about a macOS agent dispatching linux
+# runners through Docker Desktop, and our unit tests for that path
+# only exercise the predicate. This workflow exercises the binary
+# end-to-end on an actual macos runner with colima as the docker host.
+#
+# macOS GitHub-hosted runners ship without docker. Colima brings up a
+# lightweight Lima VM running dockerd and exposes a Unix socket the
+# standard docker CLI talks to. Homebrew is preinstalled on macos-latest
+# and is the conventional install path on ephemeral CI runners.
+
+on:
+  push:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  test:
+    name: cargo test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Install colima + docker (macOS only)
+        if: runner.os == 'macOS'
+        # GitHub-hosted macos-latest runners (Sequoia, M2) cannot use
+        # Apple's Virtualization.framework for nested guests, and brew's
+        # current lima (2.1.1) panics in its qemu driver under that
+        # environment. Pin lima 1.2.3 + colima 0.8.4 — the last
+        # known-good pair before the lima 2.x rework — installed from
+        # the official GitHub release tarballs with SHA256 verification
+        # so the build is not at the mercy of brew tracking head.
+        run: |
+          set -eux
+          brew install qemu docker
+          arch=$(uname -m)
+          case "$arch" in
+            arm64)
+              LIMA_TAR=lima-1.2.3-Darwin-arm64.tar.gz
+              LIMA_SHA=88751b3abc92bc6fefe9686a34d49ac5be32841a1e2d2b9b3fe7e1f87b9dbb46
+              LIMA_GUEST_TAR=lima-additional-guestagents-1.2.3-Darwin-arm64.tar.gz
+              LIMA_GUEST_SHA=68268ca88e4f757795aa97f75cdfd1c76d892aabbaed2859ac62c661c02ef6c7
+              COLIMA_BIN=colima-Darwin-arm64
+              COLIMA_SHA=30668c5a7d6ebff5886704fbc1f0da28d62620abd35270d02a4025d7a530f5c6
+              ;;
+            x86_64)
+              LIMA_TAR=lima-1.2.3-Darwin-x86_64.tar.gz
+              LIMA_SHA=ec998cc0e1ce5c49232843c019b16165ada60034cea06a4d39442c156d431d7d
+              LIMA_GUEST_TAR=lima-additional-guestagents-1.2.3-Darwin-x86_64.tar.gz
+              LIMA_GUEST_SHA=8d0f07ab70ddafd61f6d27483f3aebd0751039ea1b1c7035170150be377fef8f
+              COLIMA_BIN=colima-Darwin-x86_64
+              COLIMA_SHA=ad978c385fd957b568aeca7775110643ab6e3899e393b2df6540f971aad2963e
+              ;;
+            *) echo "unsupported arch: $arch"; exit 1 ;;
+          esac
+
+          tmp=$(mktemp -d)
+          cd "$tmp"
+
+          # ── lima 1.2.3 (host-arch tarball) ──
+          curl -fsSLO "https://github.com/lima-vm/lima/releases/download/v1.2.3/$LIMA_TAR"
+          echo "$LIMA_SHA  $LIMA_TAR" | shasum -a 256 -c -
+          sudo tar -C /usr/local -xzf "$LIMA_TAR"
+
+          # ── lima additional guest agents (cross-arch Linux-x86_64
+          #    binary so colima --arch=x86_64 can boot under TCG) ──
+          curl -fsSLO "https://github.com/lima-vm/lima/releases/download/v1.2.3/$LIMA_GUEST_TAR"
+          echo "$LIMA_GUEST_SHA  $LIMA_GUEST_TAR" | shasum -a 256 -c -
+          sudo tar -C /usr/local -xzf "$LIMA_GUEST_TAR"
+
+          # ── colima 0.8.4 ──
+          curl -fsSLO "https://github.com/abiosoft/colima/releases/download/v0.8.4/$COLIMA_BIN"
+          echo "$COLIMA_SHA  $COLIMA_BIN" | shasum -a 256 -c -
+          sudo install -m 0755 "$COLIMA_BIN" /usr/local/bin/colima
+
+          limactl --version
+          colima version
+
+          # GitHub-hosted macos-latest is M2/Sequoia; HVF (Apple's
+          # Hypervisor.framework) is not exposed to the runner VM, so
+          # qemu-system-aarch64 aborts at startup ("signal: abort trap")
+          # when it tries to initialise its default hvf accelerator.
+          # Force a cross-arch x86_64 guest — qemu-system-x86_64 on an
+          # arm host has no HVF path and falls back to TCG (software
+          # emulation), which doesn't need any virtualisation extension.
+          # Slow, but the only combination that boots cleanly on hosted
+          # macos-latest today, and we only need `docker info` to answer.
+          colima start --vm-type=qemu --arch=x86_64 --cpu 2 --memory 4 --runtime docker
+
+          docker version
+          docker info | head -20
+
+      - name: Verify docker daemon reachable (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -eux
+          docker version
+          docker info | head -20
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo build
+        run: cargo build --verbose
+
+      - name: cargo test
+        run: cargo test --verbose
+
+      - name: Smoke — binary --help renders
+        run: ./target/debug/cirun-agent --help
+
+      - name: Smoke — --executors rejects unknown values
+        shell: bash
+        run: |
+          set +e
+          out=$(CIRUN_API_TOKEN=dummy ./target/debug/cirun-agent --executors kata 2>&1)
+          rc=$?
+          set -e
+          echo "exit=$rc"
+          echo "$out" | tail -5
+          # The agent must exit non-zero AND surface the parse error.
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::--executors kata was accepted; expected rejection"
+            exit 1
+          fi
+          if ! echo "$out" | grep -qi "invalid --executors"; then
+            echo "::error::error message did not mention invalid --executors"
+            exit 1
+          fi
+
+      - name: Dump colima diagnostics on failure (macOS)
+        if: failure() && runner.os == 'macOS'
+        run: |
+          colima status || true
+          colima list || true

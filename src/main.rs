@@ -96,6 +96,18 @@ struct Args {
     #[arg(long)]
     docker_smoke_test: bool,
 
+    /// Comma-separated allow-list of executors to enable on this agent.
+    /// Accepted values: `docker`, `meda`, `lume`. When unset, the agent
+    /// enables every executor available on the host (the historical
+    /// default). Setting this suppresses the auto-install / auto-start
+    /// of any executor not listed — useful for docker-only operators
+    /// who do not want meda (linux) or lume (macOS) pulled in.
+    ///
+    /// Example: `--executors docker` runs the agent with only the
+    /// docker backend and skips meda/lume download.
+    #[arg(long, value_name = "LIST")]
+    executors: Option<String>,
+
     /// Image to use for `--docker-smoke-test` (default: `nvidia/cuda:12.4.0-base-ubuntu22.04`).
     #[arg(long, default_value = "nvidia/cuda:12.4.0-base-ubuntu22.04")]
     docker_smoke_image: String,
@@ -207,7 +219,38 @@ async fn main() {
         .api_token
         .as_ref()
         .expect("API token is required when not installing or uninstalling service");
-    let mut client = CirunClient::new(&cirun_api_url, api_token, agent_info, max_runners);
+
+    // Resolve the `--executors` allow-list. Unset keeps the historical
+    // "enable everything available on this host" behaviour
+    // (ExecutorFilter::allow_all).
+    let executor_filter = match crate::executor::parse_executor_filter(args.executors.as_deref()) {
+        Ok(f) => f,
+        Err(e) => {
+            error!("invalid --executors value: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Some(raw) = args.executors.as_ref() {
+        let mut names: Vec<&'static str> = crate::executor::ExecutorKind::ALL
+            .iter()
+            .filter(|k| executor_filter.allows(**k))
+            .map(|k| k.name())
+            .collect();
+        names.sort_unstable();
+        info!(
+            "Executors enabled by --executors {}: {}",
+            raw,
+            names.join(",")
+        );
+    }
+
+    let mut client = CirunClient::new(
+        &cirun_api_url,
+        api_token,
+        agent_info,
+        max_runners,
+        &executor_filter,
+    );
 
     // Set up log cleanup parameters based on platform
     let home_dir = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
@@ -219,13 +262,26 @@ async fn main() {
     // Bring up backend daemons that need pre-start (meda + lume; docker uses
     // the host's docker daemon directly). Selection per-runner happens via
     // payload; this is just startup-time setup.
+    //
+    // `--executors` short-circuits the download/run when the corresponding
+    // executor is not on the allow-list — that's the entire point of
+    // issue #15. Docker-only operators end up with no out-of-band binary
+    // pulls.
     #[cfg(target_os = "linux")]
     {
-        meda::setup::download_and_run_meda().await;
+        if executor_filter.allows(crate::executor::ExecutorKind::Meda) {
+            meda::setup::download_and_run_meda().await;
+        } else {
+            info!("Skipping meda setup (not in --executors allow-list)");
+        }
     }
     #[cfg(target_os = "macos")]
     {
-        lume::download_and_run_lume().await;
+        if executor_filter.allows(crate::executor::ExecutorKind::Lume) {
+            lume::download_and_run_lume().await;
+        } else {
+            info!("Skipping lume setup (not in --executors allow-list)");
+        }
     }
 
     // Seed the runner→executor map from live state. Prevents silent mis-routing

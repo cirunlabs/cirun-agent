@@ -1,0 +1,79 @@
+name: cirun-smoke-inner
+
+# Targets the on_prem docker pools declared in `.cirun.yml`. The
+# matching cirun-agent processes are installed by the companion
+# workflow `cirun-smoke-host.yml` on the same commit SHA. Each job
+# only completes when an agent picks up its label.
+
+on:
+  push:
+    branches:
+      - 'fix/**'
+      - 'feat/**'
+      - 'ci/**'
+  workflow_dispatch:
+
+jobs:
+  inner-linux:
+    name: inner (linux docker)
+    runs-on:
+      - cirun-agent-linux-docker--${{ github.run_id }}
+    timeout-minutes: 15
+    steps:
+      - name: Identity
+        run: |
+          set -eux
+          uname -a
+          cat /etc/os-release | head -3
+          whoami
+
+      - name: System stats
+        run: |
+          set -eu
+          nproc --all || true
+          free -h || true
+          df -h | head -5
+
+      - name: docker reachable
+        run: |
+          set -eu
+          for i in $(seq 1 30); do
+            docker info >/dev/null 2>&1 && break
+            sleep 1
+          done
+          docker info | head -8
+
+      - name: docker hello-world
+        run: docker run --rm hello-world | head -5
+
+  inner-mac:
+    name: inner (mac docker)
+    runs-on:
+      - cirun-agent-mac-docker--${{ github.run_id }}
+    timeout-minutes: 25
+    steps:
+      - name: Identity
+        run: |
+          set -eux
+          uname -a
+          cat /etc/os-release | head -3
+          whoami
+
+      - name: System stats
+        run: |
+          set -eu
+          nproc --all || true
+          free -h || true
+          df -h | head -5
+
+      - name: docker reachable
+        run: |
+          set -eu
+          for i in $(seq 1 30); do
+            docker info >/dev/null 2>&1 && break
+            sleep 1
+          done
+          docker info | head -8
+
+      - name: docker hello-world
+        run: docker run --rm hello-world | head -5

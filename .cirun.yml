@@ -1,0 +1,29 @@
+# Runner declarations consumed by cirun when a workflow on this repo
+# uses one of the labels below. Two pools, both using the docker
+# executor: one served by a linux cirun-agent (native dockerd), one
+# served by a macOS cirun-agent (Docker Desktop). The mac pool is the
+# end-to-end witness for issue #14 — before this branch a macOS agent
+# silently dropped any `runner.os=linux` dispatch even with docker
+# available; with the fix it picks the runner up.
+runners:
+  - name: cirun-agent-linux-docker
+    cloud: on_prem
+    instance_type: 2vcpu-4gb-20gb
+    machine_image: "ghcr.io/cirunlabs/cirun-docker-runner-image:latest"
+    region: RegionOne
+    extra_config:
+      executor: docker
+      privileged: true
+    labels:
+      - cirun-agent-linux-docker
+
+  - name: cirun-agent-mac-docker
+    cloud: on_prem
+    instance_type: 2vcpu-4gb-20gb
+    machine_image: "ghcr.io/cirunlabs/cirun-docker-runner-image:latest"
+    region: RegionOne
+    extra_config:
+      executor: docker
+      privileged: true
+    labels:
+      - cirun-agent-mac-docker

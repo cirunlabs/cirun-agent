@@ -44,7 +44,7 @@ cargo install cirun-agent
 ### From Source
 
 ```bash
-git clone https://github.com/cirun-io/cirun-agent
+git clone https://github.com/cirunlabs/cirun-agent
 cd cirun-agent
 cargo build --release
 ```
@@ -97,6 +97,7 @@ For more details, checkout docs: https://docs.cirun.io/on-prem
 | `--verbose` | `-v` | Enable verbose logging | false |
 | `--install-service` | | Install as system service | false |
 | `--max-runners` | | Maximum concurrent runners — VMs or containers (min: 1). Old alias: `--max-vms`. | 2 (macOS), unlimited (Linux) |
+| `--executors` | | Comma-separated allow-list of executor backends to enable. Accepted values: `docker`, `meda`, `lume`. When unset, every executor available on the host is enabled. Use this to suppress the auto-install of `meda` (Linux) or `lume` (macOS) — for example `--executors docker` runs a docker-only agent. | all available |
 
 ## 🔌 Virtualization
 
