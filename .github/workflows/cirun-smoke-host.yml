@@ -15,6 +15,14 @@ on:
       - 'ci/**'
   workflow_dispatch:
 
+# A re-push must cancel the previous host run before its cirun-agent
+# is left registered. Otherwise the just-re-triggered inner workflow
+# races: cirun dispatches its jobs to the stale agent from the old
+# run instead of the agent the new run is about to install.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 

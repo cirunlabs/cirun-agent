@@ -13,6 +13,14 @@ on:
       - 'ci/**'
   workflow_dispatch:
 
+# Cancel a previous inner run on the same branch when a new push
+# arrives — its host (and the agent it depended on) is being torn
+# down by the host workflow's own concurrency rule, so the old
+# inner jobs would only hang.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   inner-linux:
     name: inner (linux docker)
