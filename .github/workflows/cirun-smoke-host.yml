@@ -1,0 +1,229 @@
+name: cirun-smoke-host
+
+# Builds cirun-agent from THIS branch, installs it on the GH-hosted
+# runner (linux native; macOS via colima), and waits for the matching
+# `cirun-smoke-inner` workflow to complete. Two host legs, one per
+# OS — the macOS leg is the end-to-end witness for issue #14:
+# pre-fix the agent silently dropped `runner.os=linux` dispatches,
+# so the inner-mac job would stay queued and time out.
+
+on:
+  push:
+    branches:
+      - 'fix/**'
+      - 'feat/**'
+      - 'ci/**'
+  workflow_dispatch:
+
+# A re-push must cancel the previous host run before its cirun-agent
+# is left registered. Otherwise the just-re-triggered inner workflow
+# races: cirun dispatches its jobs to the stale agent from the old
+# run instead of the agent the new run is about to install.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  host-linux:
+    name: host (linux + docker)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Verify docker daemon
+        run: |
+          set -eux
+          docker version
+          docker info | head -10
+
+      - name: Build cirun-agent (release)
+        run: cargo build --release --locked
+
+      - name: Install cirun-agent as systemd service (from this branch)
+        env:
+          CIRUN_API_TOKEN: ${{ secrets.CIRUN_API_TOKEN }}
+        run: |
+          set -eux
+          AGENT="$PWD/target/release/cirun-agent"
+          test -x "$AGENT"
+          sudo -E "$AGENT" --install-service
+          for i in $(seq 1 15); do
+            if systemctl is-active --quiet cirun-agent; then
+              echo "cirun-agent active after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          systemctl is-active --quiet cirun-agent
+          sudo journalctl -u cirun-agent --no-pager | grep -E "Cirun Agent version|Agent ID|OS|Cirun API URL" | head -8
+
+      - name: Resolve cirun-smoke-inner run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          for i in $(seq 1 30); do
+            sleep 3
+            RUN_ID=$(gh run list --repo "$GITHUB_REPOSITORY" \
+              --workflow cirun-smoke-inner.yml --commit "$GITHUB_SHA" \
+              --limit 1 --json databaseId --jq '.[0].databaseId')
+            if [ -n "${RUN_ID:-}" ] && [ "$RUN_ID" != "null" ]; then
+              echo "INNER_RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
+              echo "inner run $RUN_ID matches commit $GITHUB_SHA"
+              exit 0
+            fi
+          done
+          echo "::error::no cirun-smoke-inner run found for $GITHUB_SHA"
+          exit 1
+
+      - name: Wait for inner-linux job to complete
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          for i in $(seq 1 120); do
+            sleep 10
+            STATE=$(gh run view "$INNER_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+              --json jobs --jq '.jobs[] | select(.name=="inner (linux docker)") | {s:.status,c:.conclusion}')
+            STATUS=$(echo "$STATE" | jq -r .s)
+            CONCL=$(echo "$STATE" | jq -r .c)
+            echo "iter $i inner-linux status=$STATUS conclusion=$CONCL"
+            if [ "$STATUS" = "completed" ]; then
+              [ "$CONCL" = "success" ] && exit 0
+              echo "::error::inner-linux conclusion=$CONCL"
+              exit 1
+            fi
+          done
+          echo "::error::timeout (20 min) waiting for inner-linux"
+          exit 1
+
+      - name: Dump cirun-agent journal
+        if: always()
+        run: sudo journalctl -u cirun-agent --no-pager | tail -200 || true
+
+  host-mac:
+    name: host (macOS + docker via colima)
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Install colima + docker (cross-arch TCG)
+        run: |
+          set -eux
+          brew install qemu docker
+          arch=$(uname -m)
+          case "$arch" in
+            arm64)
+              LIMA_TAR=lima-1.2.3-Darwin-arm64.tar.gz
+              LIMA_SHA=88751b3abc92bc6fefe9686a34d49ac5be32841a1e2d2b9b3fe7e1f87b9dbb46
+              LIMA_GUEST_TAR=lima-additional-guestagents-1.2.3-Darwin-arm64.tar.gz
+              LIMA_GUEST_SHA=68268ca88e4f757795aa97f75cdfd1c76d892aabbaed2859ac62c661c02ef6c7
+              COLIMA_BIN=colima-Darwin-arm64
+              COLIMA_SHA=30668c5a7d6ebff5886704fbc1f0da28d62620abd35270d02a4025d7a530f5c6
+              ;;
+            x86_64)
+              LIMA_TAR=lima-1.2.3-Darwin-x86_64.tar.gz
+              LIMA_SHA=ec998cc0e1ce5c49232843c019b16165ada60034cea06a4d39442c156d431d7d
+              LIMA_GUEST_TAR=lima-additional-guestagents-1.2.3-Darwin-x86_64.tar.gz
+              LIMA_GUEST_SHA=8d0f07ab70ddafd61f6d27483f3aebd0751039ea1b1c7035170150be377fef8f
+              COLIMA_BIN=colima-Darwin-x86_64
+              COLIMA_SHA=ad978c385fd957b568aeca7775110643ab6e3899e393b2df6540f971aad2963e
+              ;;
+          esac
+          tmp=$(mktemp -d); cd "$tmp"
+          curl -fsSLO "https://github.com/lima-vm/lima/releases/download/v1.2.3/$LIMA_TAR"
+          echo "$LIMA_SHA  $LIMA_TAR" | shasum -a 256 -c -
+          sudo tar -C /usr/local -xzf "$LIMA_TAR"
+          curl -fsSLO "https://github.com/lima-vm/lima/releases/download/v1.2.3/$LIMA_GUEST_TAR"
+          echo "$LIMA_GUEST_SHA  $LIMA_GUEST_TAR" | shasum -a 256 -c -
+          sudo tar -C /usr/local -xzf "$LIMA_GUEST_TAR"
+          curl -fsSLO "https://github.com/abiosoft/colima/releases/download/v0.8.4/$COLIMA_BIN"
+          echo "$COLIMA_SHA  $COLIMA_BIN" | shasum -a 256 -c -
+          sudo install -m 0755 "$COLIMA_BIN" /usr/local/bin/colima
+          colima start --vm-type=qemu --arch=x86_64 --cpu 2 --memory 4 --runtime docker
+          docker version
+          docker info | head -10
+
+      - name: Build cirun-agent (release)
+        run: cargo build --release --locked
+
+      - name: Install cirun-agent as launchd service (from this branch)
+        env:
+          CIRUN_API_TOKEN: ${{ secrets.CIRUN_API_TOKEN }}
+        run: |
+          set -eux
+          AGENT="$PWD/target/release/cirun-agent"
+          test -x "$AGENT"
+          # --install-service writes ~/Library/LaunchAgents/io.cirun.agent.plist
+          "$AGENT" --install-service
+          for i in $(seq 1 20); do
+            launchctl list io.cirun.agent >/dev/null 2>&1 && break
+            sleep 1
+          done
+          launchctl list io.cirun.agent
+          # Tail the log file the plist sends StandardOutPath to.
+          sleep 5
+          tail -40 ~/Library/Logs/cirun-agent.log || true
+
+      - name: Resolve cirun-smoke-inner run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          for i in $(seq 1 30); do
+            sleep 3
+            RUN_ID=$(gh run list --repo "$GITHUB_REPOSITORY" \
+              --workflow cirun-smoke-inner.yml --commit "$GITHUB_SHA" \
+              --limit 1 --json databaseId --jq '.[0].databaseId')
+            if [ -n "${RUN_ID:-}" ] && [ "$RUN_ID" != "null" ]; then
+              echo "INNER_RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
+              echo "inner run $RUN_ID matches commit $GITHUB_SHA"
+              exit 0
+            fi
+          done
+          echo "::error::no cirun-smoke-inner run found for $GITHUB_SHA"
+          exit 1
+
+      - name: Wait for inner-mac job to complete
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          for i in $(seq 1 180); do
+            sleep 10
+            STATE=$(gh run view "$INNER_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+              --json jobs --jq '.jobs[] | select(.name=="inner (mac docker)") | {s:.status,c:.conclusion}')
+            STATUS=$(echo "$STATE" | jq -r .s)
+            CONCL=$(echo "$STATE" | jq -r .c)
+            echo "iter $i inner-mac status=$STATUS conclusion=$CONCL"
+            if [ "$STATUS" = "completed" ]; then
+              [ "$CONCL" = "success" ] && exit 0
+              echo "::error::inner-mac conclusion=$CONCL"
+              exit 1
+            fi
+          done
+          echo "::error::timeout (30 min) waiting for inner-mac"
+          exit 1
+
+      - name: Dump cirun-agent log
+        if: always()
+        run: tail -300 ~/Library/Logs/cirun-agent.log || true

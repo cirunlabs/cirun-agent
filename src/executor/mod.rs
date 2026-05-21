@@ -20,13 +20,120 @@ pub enum ExecutorKind {
     Lume,
 }
 
-fn parse_executor_name(s: &str) -> Result<ExecutorKind, String> {
-    match s.trim().to_ascii_lowercase().as_str() {
-        "docker" => Ok(ExecutorKind::Docker),
-        "meda" => Ok(ExecutorKind::Meda),
-        "lume" => Ok(ExecutorKind::Lume),
-        other => Err(format!("unknown executor '{other}'")),
+impl ExecutorKind {
+    /// Every known executor kind. Any code that iterates over kinds
+    /// (CLI parsing, sorted name lists for the agent registration
+    /// payload, registry probing) goes through this slice so adding a
+    /// new variant is a single edit, not a hunt-and-update.
+    pub const ALL: &'static [ExecutorKind] =
+        &[ExecutorKind::Docker, ExecutorKind::Meda, ExecutorKind::Lume];
+
+    /// Lowercase wire name. The inverse of [`ExecutorKind::from_name`].
+    /// Used on the agent registration payload so the cirun api can
+    /// route by capability, and as the legal value set for the
+    /// `--executors` CLI flag.
+    pub fn name(self) -> &'static str {
+        match self {
+            ExecutorKind::Docker => "docker",
+            ExecutorKind::Meda => "meda",
+            ExecutorKind::Lume => "lume",
+        }
     }
+
+    /// Which runner OS this executor produces. Docker → linux even on
+    /// macOS hosts (Docker Desktop runs linux containers). Meda → linux
+    /// only. Lume → macOS only. Drives `executor_serves_os` and the
+    /// dispatch gate in [`crate::cirun_client::CirunClient`].
+    pub fn produced_os(self) -> &'static str {
+        match self {
+            ExecutorKind::Docker => "linux",
+            ExecutorKind::Meda => "linux",
+            ExecutorKind::Lume => "macos",
+        }
+    }
+
+    /// Default executor when a runner specifies `runner.os` but no
+    /// explicit `executor` field — historical contract for older SaaS
+    /// dispatch shapes. Returns `None` for unknown OS strings; callers
+    /// surface that as a misconfig.
+    pub fn default_for_host_os(os: &str) -> Option<ExecutorKind> {
+        match os {
+            "linux" => Some(ExecutorKind::Meda),
+            "macos" => Some(ExecutorKind::Lume),
+            _ => None,
+        }
+    }
+
+    /// Parse a wire-name string back into a kind. Case- and
+    /// whitespace-insensitive. Driven through `ALL` + `name()` so a
+    /// new variant only needs the name match arm to be reachable.
+    pub fn from_name(s: &str) -> Result<ExecutorKind, String> {
+        let lower = s.trim().to_ascii_lowercase();
+        ExecutorKind::ALL
+            .iter()
+            .find(|k| k.name() == lower)
+            .copied()
+            .ok_or_else(|| format!("unknown executor '{}'", s.trim()))
+    }
+}
+
+/// Which executors an agent is allowed to register and probe at
+/// startup. `allow_all()` is the historical behaviour (every kind
+/// available on the host). `allow_only(set)` honours the
+/// `--executors` flag from issue #15 — anything not listed is skipped
+/// at probe time and its setup step is skipped at boot.
+///
+/// Wrapping the inner `Option<HashSet<ExecutorKind>>` kills the
+/// `allows(kind)` closure that used to be redeclared in both
+/// `Registry::probe_filtered` and `main.rs`.
+#[derive(Debug, Default, Clone)]
+pub struct ExecutorFilter {
+    allow: Option<std::collections::HashSet<ExecutorKind>>,
+}
+
+impl ExecutorFilter {
+    /// No restriction — every kind available on the host is enabled.
+    /// Matches the agent's default when `--executors` is unset.
+    pub fn allow_all() -> Self {
+        Self { allow: None }
+    }
+
+    /// Restrict to exactly the given set. An empty set is rejected by
+    /// `parse_executor_filter` upstream; callers that build this
+    /// directly are trusted not to pass an empty set (the agent would
+    /// silently have no executors).
+    pub fn allow_only(set: std::collections::HashSet<ExecutorKind>) -> Self {
+        Self { allow: Some(set) }
+    }
+
+    /// Whether `kind` is admitted by the filter.
+    pub fn allows(&self, kind: ExecutorKind) -> bool {
+        self.allow.as_ref().is_none_or(|s| s.contains(&kind))
+    }
+}
+
+/// Parse a `--executors` CLI value into an [`ExecutorFilter`]. `None`
+/// (no flag) yields [`ExecutorFilter::allow_all`] — the historical
+/// behaviour. `Some("docker,meda")` yields an `allow_only` filter.
+///
+/// Issue #15: lets a docker-only operator suppress the auto-install of
+/// meda (linux) or lume (macos), which both pull binaries on first run.
+pub fn parse_executor_filter(raw: Option<&str>) -> Result<ExecutorFilter, String> {
+    let Some(s) = raw else {
+        return Ok(ExecutorFilter::allow_all());
+    };
+    let mut set = std::collections::HashSet::new();
+    for part in s.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        set.insert(ExecutorKind::from_name(trimmed)?);
+    }
+    if set.is_empty() {
+        return Err("--executors cannot be empty".into());
+    }
+    Ok(ExecutorFilter::allow_only(set))
 }
 
 /// Resolve executor kind, honouring all signals in priority order:
@@ -41,22 +148,27 @@ pub fn resolve_executor_kind(
 ) -> Result<ExecutorKind, String> {
     if let Some(s) = top_executor {
         if !s.is_empty() {
-            return parse_executor_name(s);
+            return ExecutorKind::from_name(s);
         }
     }
     if let Some(cfg) = extra_config {
         if let Some(name) = cfg.get("executor").and_then(|v| v.as_str()) {
-            return parse_executor_name(name);
+            return ExecutorKind::from_name(name);
         }
         if cfg.get("container").and_then(|v| v.as_bool()) == Some(true) {
             return Ok(ExecutorKind::Docker);
         }
     }
-    match os {
-        "linux" => Ok(ExecutorKind::Meda),
-        "macos" => Ok(ExecutorKind::Lume),
-        other => Err(format!("no default executor for os '{other}'")),
-    }
+    ExecutorKind::default_for_host_os(os)
+        .ok_or_else(|| format!("no default executor for os '{os}'"))
+}
+
+/// Whether `kind` can serve a runner with the given `runner_os`. Thin
+/// alias over [`ExecutorKind::produced_os`]; kept as a free function
+/// because the dispatch gate reads better as `executor_serves_os(k, os)`
+/// than `k.produced_os().eq_ignore_ascii_case(os)`.
+pub fn executor_serves_os(kind: ExecutorKind, runner_os: &str) -> bool {
+    runner_os.eq_ignore_ascii_case(kind.produced_os())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

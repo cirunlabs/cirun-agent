@@ -2,8 +2,15 @@
 name = "cirun-agent"
 version = "0.5.2"
 edition = "2021"
-repository = "https://github.com/aktechlabs/cirun-agent"
-authors = ["Amit Kumar <dtu.amit@gmail.com>"]
+description = "Cirun on-prem agent: provisions and manages CI/CD runners via Docker, Meda (Linux KVM VMs), and Lume (macOS VMs)."
+license = "MIT"
+repository = "https://github.com/cirunlabs/cirun-agent"
+homepage = "https://cirun.io"
+documentation = "https://docs.cirun.io/on-prem"
+readme = "README.md"
+keywords = ["cirun", "ci", "github-actions", "self-hosted", "runner"]
+categories = ["command-line-utilities", "development-tools"]
+authors = ["Amit Kumar <amit@cirun.io>"]
 
 [dependencies]
 clap = { version = "4.5.32", features = ["derive", "env"] }

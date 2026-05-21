@@ -50,6 +50,7 @@ impl CirunClient {
         api_token: &str,
         agent: AgentInfo,
         max_runners: Option<u32>,
+        executor_filter: &crate::executor::ExecutorFilter,
     ) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(15))
@@ -66,8 +67,53 @@ impl CirunClient {
             max_runners,
             runner_executors: std::sync::Mutex::new(HashMap::new()),
             in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
-            registry: Arc::new(crate::executor::registry::Registry::probe()),
+            registry: Arc::new(crate::executor::registry::Registry::probe_filtered(
+                executor_filter,
+            )),
         }
+    }
+
+    /// Whether this agent can take a given runner. Three conditions must
+    /// hold: the runner's executor must resolve, the agent must actually
+    /// have that executor registered, and the executor must produce the
+    /// requested `runner.os`.
+    ///
+    /// The old gate was `runner.os == agent.os`, which silently dropped
+    /// linux jobs from macOS agents running Docker Desktop (issue #14).
+    /// The new gate ignores the host OS and asks the executor what OS it
+    /// can serve — Docker on macOS can serve linux runners, meda is
+    /// linux-only, lume is macOS-only.
+    ///
+    /// Why the gate still matters: when the api fans the same runner out
+    /// by executor capability alone, a mismatched dispatch would attempt
+    /// provision, fail (image arch mismatch, CPU bounds, etc.), and the
+    /// racing failure notification would orphan-delete the agent that did
+    /// accept the work.
+    fn is_runner_dispatchable(&self, r: &RunnerToProvision) -> bool {
+        let kind = match crate::executor::resolve_executor_kind(
+            r.executor.as_deref(),
+            r.extra_config.as_ref(),
+            &r.os,
+        ) {
+            Ok(k) => k,
+            // Let the provision flow surface the misconfig with full context.
+            Err(_) => return true,
+        };
+        if self.registry.get(kind).is_err() {
+            debug!(
+                "Skipping runner '{}' — executor {:?} not available on this host",
+                r.name, kind
+            );
+            return false;
+        }
+        if !crate::executor::executor_serves_os(kind, &r.os) {
+            debug!(
+                "Skipping runner '{}' — executor {:?} cannot serve runner.os={}",
+                r.name, kind, r.os
+            );
+            return false;
+        }
+        true
     }
 
     /// Best-effort lookup of which executor owns a runner. Falls back to the
@@ -433,41 +479,7 @@ impl CirunClient {
                         true
                     }
                 })
-                .filter(|r| {
-                    // OS gate: a runner with `os: linux` must not be claimed
-                    // by a macos agent (and vice-versa), even if both have a
-                    // common executor like docker. Mismatched OS dispatches
-                    // arrive when the api fans out by executor capability
-                    // alone; without this filter the wrong-OS agent would
-                    // attempt provision, fail (image arch mismatch, CPU
-                    // bounds, etc.), and the racing failure notification
-                    // would cause an orphan-delete on the agent that did
-                    // accept the work.
-                    if !r.os.eq_ignore_ascii_case(&self.agent.os) {
-                        debug!(
-                            "Skipping runner '{}' — runner.os={} does not match agent.os={}",
-                            r.name, r.os, self.agent.os
-                        );
-                        return false;
-                    }
-                    let kind = match crate::executor::resolve_executor_kind(
-                        r.executor.as_deref(),
-                        r.extra_config.as_ref(),
-                        &r.os,
-                    ) {
-                        Ok(k) => k,
-                        Err(_) => return true, // let provision flow surface the misconfig
-                    };
-                    if self.registry.get(kind).is_ok() {
-                        true
-                    } else {
-                        debug!(
-                            "Skipping runner '{}' — executor {:?} not available on this host",
-                            r.name, kind
-                        );
-                        false
-                    }
-                })
+                .filter(|r| self.is_runner_dispatchable(r))
                 .cloned()
                 .collect();
 
@@ -663,6 +675,81 @@ mod tests {
             map.get("cirun-r1"),
             Some(&ExecutorKind::Docker),
             "binding must persist after a successful delete so SaaS retries do not fall back to the OS-default executor"
+        );
+    }
+
+    fn make_runner(name: &str, runner_os: &str, executor: Option<&str>) -> RunnerToProvision {
+        RunnerToProvision {
+            name: name.into(),
+            provision_script: String::new(),
+            image: "ubuntu:24.04".into(),
+            os: runner_os.into(),
+            cpu: 2,
+            memory: 4,
+            disk: 20,
+            login: crate::api::RunnerLogin {
+                username: "runner".into(),
+                password: "p".into(),
+            },
+            max_retries: 3,
+            executor: executor.map(|s| s.to_string()),
+            gpu: None,
+            extra_config: None,
+        }
+    }
+
+    fn macos_test_client(registry: Arc<Registry>) -> CirunClient {
+        let mut c = test_client(registry);
+        c.agent.os = "macos".into();
+        c
+    }
+
+    /// Regression for issue #14 — a macOS agent that has Docker registered
+    /// must accept a `runner.os=linux` job dispatched with `executor=docker`.
+    /// Old gate compared runner.os to agent.os and dropped these silently.
+    #[tokio::test]
+    async fn macos_agent_with_docker_dispatches_linux_runner() {
+        let mut execs: HashMap<ExecutorKind, Arc<dyn Executor>> = HashMap::new();
+        execs.insert(ExecutorKind::Docker, Arc::new(RecordingExecutor::new()));
+        let registry = Arc::new(Registry::from_executors(execs));
+        let client = macos_test_client(registry);
+
+        let runner = make_runner("cirun-r1", "linux", Some("docker"));
+        assert!(
+            client.is_runner_dispatchable(&runner),
+            "Docker on macOS must serve linux runners (issue #14)"
+        );
+    }
+
+    /// Lume on macOS cannot run linux containers; an explicit lume+linux
+    /// dispatch must be rejected.
+    #[tokio::test]
+    async fn macos_agent_with_only_lume_drops_linux_runner() {
+        let mut execs: HashMap<ExecutorKind, Arc<dyn Executor>> = HashMap::new();
+        execs.insert(ExecutorKind::Lume, Arc::new(RecordingExecutor::new()));
+        let registry = Arc::new(Registry::from_executors(execs));
+        let client = macos_test_client(registry);
+
+        let runner = make_runner("cirun-r1", "linux", Some("lume"));
+        assert!(
+            !client.is_runner_dispatchable(&runner),
+            "lume cannot serve linux runners regardless of host"
+        );
+    }
+
+    /// Capability gate: a linux runner asking for docker on an agent that
+    /// has no docker registered must be dropped.
+    #[tokio::test]
+    async fn agent_without_requested_executor_drops_runner() {
+        let mut execs: HashMap<ExecutorKind, Arc<dyn Executor>> = HashMap::new();
+        execs.insert(ExecutorKind::Meda, Arc::new(RecordingExecutor::new()));
+        let registry = Arc::new(Registry::from_executors(execs));
+        let client = test_client(registry); // agent.os = linux
+
+        let runner = make_runner("cirun-r1", "linux", Some("docker"));
+        assert!(
+            !client.is_runner_dispatchable(&runner),
+            "agent without docker must not accept a docker-tagged runner"
         );
     }
 

@@ -1,7 +1,7 @@
 //! Executor registry. Holds available executors per host, exposes lookup and
 //! aggregation operations (cross-executor list / count) used by the main loop.
 
-use super::{Executor, ExecutorKind, OwnedRunner, ProvisionError};
+use super::{Executor, ExecutorFilter, ExecutorKind, OwnedRunner, ProvisionError};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -10,32 +10,50 @@ pub struct Registry {
 }
 
 impl Registry {
-    /// Probe what executors can plausibly run on this host. Construction
-    /// failures (daemon down, binary missing) silently drop that executor —
-    /// it just won't appear in the registry. Caller resolves missing
-    /// executors as `BackendUnavailable`.
-    pub fn probe() -> Self {
+    /// Probe what executors can plausibly run on this host, honouring an
+    /// optional `--executors` allow-list. `None` means "all kinds available
+    /// for this host" — the historical default. `Some(set)` skips probing
+    /// any executor not in the set; this is wired from the `--executors`
+    /// CLI flag (issue #15) so docker-only operators can suppress the
+    /// meda/lume auto-probe.
+    ///
+    /// Construction failures (daemon down, binary missing) silently drop
+    /// that executor — it just won't appear in the registry. Caller
+    /// resolves missing executors as `BackendUnavailable`.
+    pub fn probe_filtered(filter: &ExecutorFilter) -> Self {
         let mut executors: HashMap<ExecutorKind, Arc<dyn Executor>> = HashMap::new();
-        // Docker works on any OS (Linux native, macOS via Docker Desktop) —
-        // register if the daemon answers a ping.
-        let docker = super::docker::DockerExecutor::new();
-        match docker.client_ping() {
-            Ok(v) => {
-                log::info!("docker daemon reachable: {v}");
-                executors.insert(ExecutorKind::Docker, Arc::new(docker));
+        if filter.allows(ExecutorKind::Docker) {
+            // Docker works on any OS (Linux native, macOS via Docker Desktop) —
+            // register if the daemon answers a ping.
+            let docker = super::docker::DockerExecutor::new();
+            match docker.client_ping() {
+                Ok(v) => {
+                    log::info!("docker daemon reachable: {v}");
+                    executors.insert(ExecutorKind::Docker, Arc::new(docker));
+                }
+                Err(e) => log::info!("docker daemon not available (skipping): {e}"),
             }
-            Err(e) => log::info!("docker daemon not available (skipping): {e}"),
+        } else {
+            log::info!("docker executor disabled by --executors filter");
         }
         #[cfg(target_os = "linux")]
         {
-            if let Ok(m) = super::meda::MedaExecutor::new() {
-                executors.insert(ExecutorKind::Meda, Arc::new(m));
+            if filter.allows(ExecutorKind::Meda) {
+                if let Ok(m) = super::meda::MedaExecutor::new() {
+                    executors.insert(ExecutorKind::Meda, Arc::new(m));
+                }
+            } else {
+                log::info!("meda executor disabled by --executors filter");
             }
         }
         #[cfg(target_os = "macos")]
         {
-            if let Ok(l) = super::lume::LumeExecutor::new() {
-                executors.insert(ExecutorKind::Lume, Arc::new(l));
+            if filter.allows(ExecutorKind::Lume) {
+                if let Ok(l) = super::lume::LumeExecutor::new() {
+                    executors.insert(ExecutorKind::Lume, Arc::new(l));
+                }
+            } else {
+                log::info!("lume executor disabled by --executors filter");
             }
         }
         Self { executors }
@@ -59,15 +77,7 @@ impl Registry {
     /// `"lume"`), sorted for deterministic wire output. Sent on the agent's GET
     /// /agent body so the cirun api can route by capability instead of host OS.
     pub fn kind_names(&self) -> Vec<&'static str> {
-        let mut out: Vec<&'static str> = self
-            .executors
-            .keys()
-            .map(|k| match k {
-                ExecutorKind::Docker => "docker",
-                ExecutorKind::Meda => "meda",
-                ExecutorKind::Lume => "lume",
-            })
-            .collect();
+        let mut out: Vec<&'static str> = self.executors.keys().map(|k| k.name()).collect();
         out.sort_unstable();
         out
     }
