@@ -10,6 +10,7 @@ name: cirun-smoke-host
 on:
   push:
     branches:
+      - main
       - 'fix/**'
       - 'feat/**'
       - 'ci/**'

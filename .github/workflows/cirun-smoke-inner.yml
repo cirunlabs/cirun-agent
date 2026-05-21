@@ -8,6 +8,7 @@ name: cirun-smoke-inner
 on:
   push:
     branches:
+      - main
       - 'fix/**'
       - 'feat/**'
       - 'ci/**'
