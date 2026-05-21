@@ -1,0 +1,37 @@
+name: publish-crate
+
+# Publishes the crate to crates.io. Fires automatically when a release
+# tag (v*) is pushed, so `release.sh` now also lands the crate — not
+# just the GitHub binary release. workflow_dispatch is kept so a tag
+# that predates this workflow (e.g. v0.6.0) can be published manually:
+#   gh workflow run publish-crate.yml --ref v0.6.0
+#
+# Requires a CARGO_REGISTRY_TOKEN repo secret: a crates.io API token
+# with the publish-new + publish-update scopes
+# (https://crates.io/settings/tokens).
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: cargo publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked
