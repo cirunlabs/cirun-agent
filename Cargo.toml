@@ -1,6 +1,6 @@
 [package]
 name = "cirun-agent"
-version = "0.5.2"
+version = "0.6.0"
 edition = "2021"
 description = "Cirun on-prem agent: provisions and manages CI/CD runners via Docker, Meda (Linux KVM VMs), and Lume (macOS VMs)."
 license = "MIT"
