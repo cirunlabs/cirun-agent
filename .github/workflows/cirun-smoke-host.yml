@@ -93,8 +93,18 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eu
-          for i in $(seq 1 120); do
-            sleep 10
+          # Two-phase wait. The agent is already registered by now, so if
+          # cirun is going to dispatch the runner it does so within ~25s.
+          # Phase 1: give it 2 min to leave 'queued'; if it hasn't been
+          # picked up by then, dispatch is stuck — fail fast instead of
+          # hanging 20+ min. Phase 2: once running, allow it to finish.
+          PICKUP_ITERS=24   # 24 x 5s = 2 min to get picked up
+          RUN_ITERS=120     # then 120 x 5s = 10 min to run to completion
+          picked_up=false
+          i=0
+          while [ "$i" -lt "$((PICKUP_ITERS + RUN_ITERS))" ]; do
+            i=$((i + 1))
+            sleep 5
             STATE=$(gh run view "$INNER_RUN_ID" --repo "$GITHUB_REPOSITORY" \
               --json jobs --jq '.jobs[] | select(.name=="inner (linux docker)") | {s:.status,c:.conclusion}')
             STATUS=$(echo "$STATE" | jq -r .s)
@@ -105,13 +115,31 @@ jobs:
               echo "::error::inner-linux conclusion=$CONCL"
               exit 1
             fi
+            if [ "$STATUS" != "queued" ]; then
+              picked_up=true
+            fi
+            if [ "$picked_up" = false ] && [ "$i" -ge "$PICKUP_ITERS" ]; then
+              echo "::error::inner-linux still queued after 2 min — cirun never dispatched the runner to an agent"
+              exit 1
+            fi
           done
-          echo "::error::timeout (20 min) waiting for inner-linux"
+          echo "::error::timeout waiting for inner-linux to finish running"
           exit 1
 
-      - name: Dump cirun-agent journal
+      - name: Capture cirun-agent journal
         if: always()
-        run: sudo journalctl -u cirun-agent --no-pager | tail -200 || true
+        run: |
+          sudo journalctl -u cirun-agent --no-pager > cirun-agent-linux.log 2>&1 || true
+          echo "--- last 40 lines (full journal in the uploaded artifact) ---"
+          tail -40 cirun-agent-linux.log || true
+
+      - name: Upload cirun-agent journal
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cirun-agent-journal-linux
+          path: cirun-agent-linux.log
+          if-no-files-found: warn
 
   host-mac:
     name: host (macOS + docker via colima)
@@ -209,8 +237,16 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eu
-          for i in $(seq 1 180); do
-            sleep 10
+          # Two-phase wait — see the linux job for the rationale. Phase 1
+          # fails fast if cirun hasn't dispatched the runner within 2 min
+          # of the agent being up; phase 2 lets a picked-up job finish.
+          PICKUP_ITERS=24   # 24 x 5s = 2 min to get picked up
+          RUN_ITERS=120     # then 120 x 5s = 10 min to run to completion
+          picked_up=false
+          i=0
+          while [ "$i" -lt "$((PICKUP_ITERS + RUN_ITERS))" ]; do
+            i=$((i + 1))
+            sleep 5
             STATE=$(gh run view "$INNER_RUN_ID" --repo "$GITHUB_REPOSITORY" \
               --json jobs --jq '.jobs[] | select(.name=="inner (mac docker)") | {s:.status,c:.conclusion}')
             STATUS=$(echo "$STATE" | jq -r .s)
@@ -221,10 +257,30 @@ jobs:
               echo "::error::inner-mac conclusion=$CONCL"
               exit 1
             fi
+            if [ "$STATUS" != "queued" ]; then
+              picked_up=true
+            fi
+            if [ "$picked_up" = false ] && [ "$i" -ge "$PICKUP_ITERS" ]; then
+              echo "::error::inner-mac still queued after 2 min — cirun never dispatched the runner to an agent"
+              exit 1
+            fi
           done
-          echo "::error::timeout (30 min) waiting for inner-mac"
+          echo "::error::timeout waiting for inner-mac to finish running"
           exit 1
 
-      - name: Dump cirun-agent log
+      - name: Capture cirun-agent log
         if: always()
-        run: tail -300 ~/Library/Logs/cirun-agent.log || true
+        run: |
+          mkdir -p agent-logs
+          cp ~/Library/Logs/cirun-agent.log agent-logs/cirun-agent-mac.log 2>/dev/null || true
+          cp ~/Library/Logs/cirun-agent.error.log agent-logs/cirun-agent-mac.error.log 2>/dev/null || true
+          echo "--- last 40 lines (full log in the uploaded artifact) ---"
+          tail -40 agent-logs/cirun-agent-mac.log || true
+
+      - name: Upload cirun-agent log
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cirun-agent-log-mac
+          path: agent-logs/
+          if-no-files-found: warn

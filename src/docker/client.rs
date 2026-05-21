@@ -113,7 +113,23 @@ impl DockerClient {
     /// Run a runner container detached. Returns the container ID on success.
     pub fn run_runner(&self, spec: &RunnerContainerSpec) -> Result<String, DockerError> {
         let argv = Self::build_run_argv(spec);
-        debug!("docker {}", argv.join(" "));
+        // Never log the full argv: it carries `-e` env values and the
+        // provision script (`bash -lc <script>`), which embed the GitHub
+        // runner registration token and the runner password. Log only
+        // the structural flags plus env var *names* — enough to debug a
+        // `docker run` without leaking secrets into the journal/artifacts.
+        debug!(
+            "docker run name={} image={} privileged={} socket_mount={} env_keys=[{}]",
+            spec.name,
+            spec.image,
+            spec.privileged,
+            spec.mount_docker_socket,
+            spec.env
+                .iter()
+                .map(|(k, _)| k.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
         let out = Command::new(&self.bin).args(&argv).output()?;
         if !out.status.success() {
             return Err(DockerError::CommandFailed {
