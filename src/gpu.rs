@@ -345,7 +345,9 @@ mod reconcile_semantics {
     fn reconcile_with_no_running_vms_frees_everything() {
         let a = GpuAllocator::new(vec!["/sys/pci/gpu0".into()]);
         a.reconcile(&[("vm-old".to_string(), vec!["/sys/pci/gpu0".to_string()])]);
-        assert!(a.allocate(&GpuRequest::All, "vm-x").is_err() || true);
+        // vm-old holds the only GPU, so a fresh allocation must fail.
+        assert!(a.allocate(&GpuRequest::All, "vm-x").is_err());
+        // Reconcile with no running VMs frees everything.
         a.reconcile(&[]);
         assert_eq!(a.allocate(&GpuRequest::All, "vm-new").unwrap().len(), 1);
     }
