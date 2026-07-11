@@ -100,14 +100,14 @@ impl CirunClient {
             Err(_) => return true,
         };
         if self.registry.get(kind).is_err() {
-            debug!(
+            info!(
                 "Skipping runner '{}' — executor {:?} not available on this host",
                 r.name, kind
             );
             return false;
         }
         if !crate::executor::executor_serves_os(kind, &r.os) {
-            debug!(
+            info!(
                 "Skipping runner '{}' — executor {:?} cannot serve runner.os={}",
                 r.name, kind, r.os
             );

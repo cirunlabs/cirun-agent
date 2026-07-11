@@ -25,6 +25,9 @@ pub struct VmRunRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "disk")]
     pub disk_size: Option<String>,
+    /// VFIO device paths for PCI passthrough (meda `devices` field).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -37,6 +40,10 @@ pub struct VmInfo {
     pub memory: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpus: Option<u32>,
+    /// VFIO devices currently attached (reported by meda); drives GPU
+    /// lease reconciliation after agent restart.
+    #[serde(default)]
+    pub devices: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
