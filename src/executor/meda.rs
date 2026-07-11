@@ -90,6 +90,19 @@ fn discover_host_gpus() -> Vec<String> {
     crate::gpu::discover_nvidia_gpus(Path::new("/sys/bus/pci/devices"))
 }
 
+/// Map a GPU allocation failure to a provision error. GPU exhaustion ("no
+/// free GPU right now") is backpressure, not a failure: return `HostFull` so
+/// the backend queues the job as "at capacity" and re-fans it promptly,
+/// instead of marking it failed and applying retry backoff (which strands
+/// the GPU idle while jobs wait out their backoff timers).
+fn gpu_alloc_error(e: crate::gpu::GpuError) -> ProvisionError {
+    ProvisionError::HostFull {
+        code: "gpu_at_capacity".to_string(),
+        message: e.to_string(),
+        retry_after_secs: 5,
+    }
+}
+
 /// Build the meda run request for a spec plus its leased devices. Pure, so
 /// the GPU wiring is testable without a live meda.
 pub(super) fn build_run_request(
@@ -126,7 +139,7 @@ impl Executor for MedaExecutor {
             self.ensure_gpu_reconciled().await?;
             self.gpus
                 .allocate(&spec.gpu, &spec.name)
-                .map_err(|e| ProvisionError::transient(format!("gpu allocation: {e}")))?
+                .map_err(gpu_alloc_error)?
         };
         if !devices.is_empty() {
             log::info!("VM '{}' leasing GPUs: {devices:?}", spec.name);
@@ -283,6 +296,24 @@ mod gpu_wiring_tests {
                 username: String::new(),
                 password: String::new(),
             },
+        }
+    }
+
+    #[test]
+    fn gpu_exhaustion_maps_to_host_full_not_failure() {
+        let a = crate::gpu::GpuAllocator::new(vec!["/sys/pci/gpu0".into()]);
+        a.allocate(&GpuRequest::Count(1), "vm-a").unwrap();
+        let err = a.allocate(&GpuRequest::All, "vm-b").unwrap_err();
+        match gpu_alloc_error(err) {
+            ProvisionError::HostFull {
+                code,
+                retry_after_secs,
+                ..
+            } => {
+                assert_eq!(code, "gpu_at_capacity");
+                assert!(retry_after_secs > 0);
+            }
+            other => panic!("GPU exhaustion must be HostFull backpressure, got {other:?}"),
         }
     }
 
