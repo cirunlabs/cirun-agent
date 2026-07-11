@@ -279,7 +279,7 @@ mod gpu_wiring_tests {
             gpu,
             docker_privileged: false,
             docker_mount_socket: false,
-            login: super::RunnerLogin {
+            login: crate::executor::RunnerLogin {
                 username: String::new(),
                 password: String::new(),
             },
