@@ -1,9 +1,12 @@
 //! Meda adapter: wraps `crate::meda::client::MedaClient` behind the `Executor` trait.
 
-use super::{Executor, OwnedRunner, ProvisionError, RunnerSpec, RunnerState};
+use super::{Executor, GpuRequest, OwnedRunner, ProvisionError, RunnerSpec, RunnerState};
+use crate::gpu::GpuAllocator;
 use async_trait::async_trait;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::OnceCell;
 
 /// Map a meda VM state string onto `RunnerState`.
 ///
@@ -23,6 +26,11 @@ pub(super) fn map_vm_state(status: &str) -> RunnerState {
 
 pub struct MedaExecutor {
     client: Arc<crate::meda::client::MedaClient>,
+    gpus: Arc<GpuAllocator>,
+    /// GPU lease state is rebuilt from meda exactly once, lazily, before the
+    /// first allocation. Lazy because reconcile needs an async list_vms call
+    /// and new() is sync.
+    gpu_reconciled: OnceCell<()>,
 }
 
 impl MedaExecutor {
@@ -31,7 +39,66 @@ impl MedaExecutor {
             .map_err(|e| ProvisionError::transient(format!("meda init: {e}")))?;
         Ok(Self {
             client: Arc::new(client),
+            gpus: Arc::new(GpuAllocator::new(discover_host_gpus())),
+            gpu_reconciled: OnceCell::new(),
         })
+    }
+
+    /// Rebuild GPU leases from what meda reports as attached, once.
+    async fn ensure_gpu_reconciled(&self) -> Result<(), ProvisionError> {
+        self.gpu_reconciled
+            .get_or_try_init(|| async {
+                let vms = self
+                    .client
+                    .list_vms()
+                    .await
+                    .map_err(|e| ProvisionError::transient(format!("meda list_vms: {e:?}")))?;
+                let running: Vec<(String, Vec<String>)> = vms
+                    .into_iter()
+                    .filter(|v| !v.devices.is_empty())
+                    .map(|v| (v.name, v.devices))
+                    .collect();
+                self.gpus.reconcile(&running);
+                for (device, holder) in self.gpus.snapshot() {
+                    log::info!(
+                        "GPU inventory: {device} {}",
+                        holder.map_or("free".to_string(), |vm| format!("leased to {vm}"))
+                    );
+                }
+                Ok(())
+            })
+            .await
+            .map(|_| ())
+    }
+}
+
+/// Host GPU inventory: CIRUN_VFIO_DEVICES (comma-separated sysfs paths)
+/// overrides; otherwise auto-detect NVIDIA display devices on the PCI bus.
+fn discover_host_gpus() -> Vec<String> {
+    if let Ok(explicit) = std::env::var("CIRUN_VFIO_DEVICES") {
+        return explicit
+            .split(",")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
+    }
+    crate::gpu::discover_nvidia_gpus(Path::new("/sys/bus/pci/devices"))
+}
+
+/// Build the meda run request for a spec plus its leased devices. Pure, so
+/// the GPU wiring is testable without a live meda.
+pub(super) fn build_run_request(
+    spec: &RunnerSpec,
+    devices: Vec<String>,
+) -> crate::meda::models::VmRunRequest {
+    crate::meda::models::VmRunRequest {
+        image: spec.image.clone(),
+        name: Some(spec.name.clone()),
+        memory: Some(format!("{}G", spec.memory_gb)),
+        cpus: Some(spec.cpu),
+        disk_size: Some(format!("{}G", spec.disk_gb)),
+        devices,
     }
 }
 
@@ -49,19 +116,23 @@ impl Executor for MedaExecutor {
     }
 
     async fn spawn(&self, spec: &RunnerSpec) -> Result<(), ProvisionError> {
-        use crate::meda::models::VmRunRequest;
-        let req = VmRunRequest {
-            image: spec.image.clone(),
-            name: Some(spec.name.clone()),
-            memory: Some(format!("{}G", spec.memory_gb)),
-            cpus: Some(spec.cpu),
-            disk_size: Some(format!("{}G", spec.disk_gb)),
+        let devices = if matches!(spec.gpu, GpuRequest::None) {
+            Vec::new()
+        } else {
+            self.ensure_gpu_reconciled().await?;
+            self.gpus
+                .allocate(&spec.gpu, &spec.name)
+                .map_err(|e| ProvisionError::transient(format!("gpu allocation: {e}")))?
         };
+        if !devices.is_empty() {
+            log::info!("VM '{}' leasing GPUs: {devices:?}", spec.name);
+        }
+        let req = build_run_request(spec, devices);
         // Map admission-control 503s onto ProvisionError::HostFull so
         // the provision flow can signal "at capacity" upstream without
         // burning the runner's retry budget. Other meda errors are
         // genuine failures and stay as Transient.
-        match self.client.run_vm(req).await {
+        let result = match self.client.run_vm(req).await {
             Ok(()) => Ok(()),
             Err(crate::meda::errors::MedaError::HostFull {
                 code,
@@ -73,14 +144,24 @@ impl Executor for MedaExecutor {
                 retry_after_secs,
             }),
             Err(e) => Err(ProvisionError::transient(format!("meda run_vm: {e:?}"))),
+        };
+        // A failed boot must not strand its GPU lease.
+        if result.is_err() {
+            self.gpus.release(&spec.name);
         }
+        result
     }
 
     async fn kill(&self, name: &str) -> Result<(), ProvisionError> {
         self.client
             .delete_vm(name)
             .await
-            .map_err(|e| ProvisionError::transient(format!("meda delete_vm: {e:?}")))
+            .map_err(|e| ProvisionError::transient(format!("meda delete_vm: {e:?}")))?;
+        let freed = self.gpus.release(name);
+        if freed > 0 {
+            log::info!("VM '{name}' released {freed} GPU(s)");
+        }
+        Ok(())
     }
 
     async fn list_owned(&self) -> Result<Vec<OwnedRunner>, ProvisionError> {
@@ -175,5 +256,44 @@ mod tests {
     #[test]
     fn unknown_maps_to_starting() {
         assert_eq!(map_vm_state("weirdo"), RunnerState::Starting);
+    }
+}
+
+#[cfg(test)]
+mod gpu_wiring_tests {
+    use super::*;
+    use crate::executor::GpuRequest;
+
+    fn spec(gpu: GpuRequest) -> RunnerSpec {
+        RunnerSpec {
+            name: "cirun-test-vm".into(),
+            image: "ubuntu:latest".into(),
+            cpu: 4,
+            memory_gb: 8,
+            disk_gb: 50,
+            gpu,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn run_request_carries_leased_devices() {
+        let req = build_run_request(
+            &spec(GpuRequest::Count(1)),
+            vec!["/sys/bus/pci/devices/0000:01:00.0".into()],
+        );
+        assert_eq!(req.devices, vec!["/sys/bus/pci/devices/0000:01:00.0"]);
+        assert_eq!(req.name.as_deref(), Some("cirun-test-vm"));
+    }
+
+    #[test]
+    fn run_request_omits_devices_for_cpu_jobs() {
+        let req = build_run_request(&spec(GpuRequest::None), Vec::new());
+        assert!(req.devices.is_empty());
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            !json.contains("devices"),
+            "empty devices must not serialize: {json}"
+        );
     }
 }

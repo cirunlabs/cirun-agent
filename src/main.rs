@@ -4,6 +4,8 @@ mod cirun_client;
 mod config;
 mod docker;
 mod executor;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod gpu;
 #[cfg(target_os = "macos")]
 mod lume;
 #[cfg(target_os = "linux")]
