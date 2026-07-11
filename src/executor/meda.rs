@@ -271,12 +271,18 @@ mod gpu_wiring_tests {
     fn spec(gpu: GpuRequest) -> RunnerSpec {
         RunnerSpec {
             name: "cirun-test-vm".into(),
+            provision_script: String::new(),
             image: "ubuntu:latest".into(),
             cpu: 4,
             memory_gb: 8,
             disk_gb: 50,
             gpu,
-            ..Default::default()
+            docker_privileged: false,
+            docker_mount_socket: false,
+            login: super::RunnerLogin {
+                username: String::new(),
+                password: String::new(),
+            },
         }
     }
 
