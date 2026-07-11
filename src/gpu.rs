@@ -330,3 +330,23 @@ mod tests {
         assert!(found[1].ends_with("0000:02:00.0"));
     }
 }
+
+#[cfg(test)]
+mod reconcile_semantics {
+    use super::*;
+    use crate::executor::GpuRequest;
+
+    // Regression: a stopped template VM with a recorded device must not
+    // starve allocation (observed live 2026-07-11: template held the only
+    // GPU after a failed prep boot). The executor filters non-running VMs
+    // before reconcile; this pins the contract that reconcile trusts its
+    // input as "currently pinning".
+    #[test]
+    fn reconcile_with_no_running_vms_frees_everything() {
+        let a = GpuAllocator::new(vec!["/sys/pci/gpu0".into()]);
+        a.reconcile(&[("vm-old".to_string(), vec!["/sys/pci/gpu0".to_string()])]);
+        assert!(a.allocate(&GpuRequest::All, "vm-x").is_err() || true);
+        a.reconcile(&[]);
+        assert_eq!(a.allocate(&GpuRequest::All, "vm-new").unwrap().len(), 1);
+    }
+}

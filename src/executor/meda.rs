@@ -53,9 +53,13 @@ impl MedaExecutor {
                     .list_vms()
                     .await
                     .map_err(|e| ProvisionError::transient(format!("meda list_vms: {e:?}")))?;
+                // Only running VMs physically pin a VFIO device. Stopped VMs
+                // (notably meda's image template after a prep boot) keep the
+                // device in their recorded config but hold nothing — counting
+                // them starves every future GPU lease.
                 let running: Vec<(String, Vec<String>)> = vms
                     .into_iter()
-                    .filter(|v| !v.devices.is_empty())
+                    .filter(|v| v.state == "running" && !v.devices.is_empty())
                     .map(|v| (v.name, v.devices))
                     .collect();
                 self.gpus.reconcile(&running);
