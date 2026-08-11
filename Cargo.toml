@@ -31,6 +31,7 @@ tar = "0.4.44"
 walkdir = "2.5.0"
 chrono = "0.4.40"
 async-trait = "0.1.83"
+sysinfo = "=0.38.4"
 
 # The profile that 'dist' will build with
 [profile.dist]

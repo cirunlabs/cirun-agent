@@ -9,6 +9,9 @@ pub struct AgentInfo {
     pub os: String,
     pub arch: String,
     pub version: String,
+    pub cpu_cores: u32,
+    pub memory_gb: u32,
+    pub disk_gb: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

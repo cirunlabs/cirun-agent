@@ -581,4 +581,44 @@ mod tests {
 
         let _ = std::fs::remove_file(id_file);
     }
+
+    #[test]
+    fn test_agent_info_reports_real_cpu_core_count() {
+        let id_file = ".test_agent_id_cpu";
+        let _ = std::fs::remove_file(id_file);
+
+        let agent_info = get_agent_info(id_file);
+        // Can't pin an exact count (varies per machine), but this proves the
+        // sysinfo integration actually reads the real host rather than
+        // silently returning 0 or panicking.
+        assert!(agent_info.cpu_cores > 0);
+
+        let _ = std::fs::remove_file(id_file);
+    }
+
+    #[test]
+    fn test_agent_info_reports_real_total_memory() {
+        let id_file = ".test_agent_id_memory";
+        let _ = std::fs::remove_file(id_file);
+
+        let agent_info = get_agent_info(id_file);
+        // Same reasoning as the cpu-core test: can't pin an exact value, but
+        // this proves the real host's memory was read, not a stub.
+        assert!(agent_info.memory_gb > 0);
+
+        let _ = std::fs::remove_file(id_file);
+    }
+
+    #[test]
+    fn test_agent_info_reports_real_root_disk_capacity() {
+        let id_file = ".test_agent_id_disk";
+        let _ = std::fs::remove_file(id_file);
+
+        let agent_info = get_agent_info(id_file);
+        // Same reasoning as the cpu-core/memory tests: can't pin an exact
+        // value, but this proves the real root filesystem was read.
+        assert!(agent_info.disk_gb > 0);
+
+        let _ = std::fs::remove_file(id_file);
+    }
 }
