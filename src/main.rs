@@ -570,4 +570,15 @@ mod tests {
         // Clean up
         let _ = std::fs::remove_file(id_file);
     }
+
+    #[test]
+    fn test_agent_info_includes_own_crate_version() {
+        let id_file = ".test_agent_id_version";
+        let _ = std::fs::remove_file(id_file);
+
+        let agent_info = get_agent_info(id_file);
+        assert_eq!(agent_info.version, env!("CARGO_PKG_VERSION"));
+
+        let _ = std::fs::remove_file(id_file);
+    }
 }

@@ -8,6 +8,7 @@ pub struct AgentInfo {
     pub hostname: String,
     pub os: String,
     pub arch: String,
+    pub version: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

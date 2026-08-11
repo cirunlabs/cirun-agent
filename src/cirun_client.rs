@@ -637,6 +637,7 @@ mod tests {
                 hostname: "h".into(),
                 os: "linux".into(),
                 arch: "x86_64".into(),
+                version: "0.0.0-test".into(),
             },
             retry_tracker: std::sync::Mutex::new(HashMap::new()),
             max_runners: None,

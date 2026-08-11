@@ -86,5 +86,6 @@ pub fn get_agent_info(id_file: &str) -> AgentInfo {
         hostname: get_hostname(),
         os,
         arch: env::consts::ARCH.to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
     }
 }
