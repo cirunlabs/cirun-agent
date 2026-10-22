@@ -30,7 +30,7 @@ flate2 = "1.1.0"
 tar = "0.4.44"
 walkdir = "2.5.0"
 chrono = "0.4.40"
-async-trait = "0.1.83"
+async-trait = "=0.1.92"
 sysinfo = "=0.38.4"
 
 # The profile that 'dist' will build with
