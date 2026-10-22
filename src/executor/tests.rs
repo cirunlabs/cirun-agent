@@ -73,6 +73,7 @@ fn spec(name: &str) -> RunnerSpec {
         gpu: GpuRequest::None,
         docker_privileged: false,
         docker_mount_socket: false,
+        meda_cold_boot: false,
         login: RunnerLogin {
             username: "runner".into(),
             password: "p".into(),
@@ -189,6 +190,17 @@ fn resolve_extra_config_executor_is_case_insensitive() {
         resolve_executor_kind(None, Some(&cfg), "linux").unwrap(),
         ExecutorKind::Meda
     );
+}
+
+#[test]
+fn extra_config_flag_reads_true_bools_only() {
+    let cfg = json!({"cold_boot": true, "privileged": false, "docker_socket_mount": "yes"});
+    assert!(extra_config_flag(Some(&cfg), "cold_boot"));
+    assert!(!extra_config_flag(Some(&cfg), "privileged"));
+    // Wrong type, missing key, or no extra_config at all: off.
+    assert!(!extra_config_flag(Some(&cfg), "docker_socket_mount"));
+    assert!(!extra_config_flag(Some(&cfg), "absent"));
+    assert!(!extra_config_flag(None, "cold_boot"));
 }
 
 #[test]
