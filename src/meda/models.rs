@@ -28,6 +28,9 @@ pub struct VmRunRequest {
     /// VFIO device paths for PCI passthrough (meda `devices` field).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub devices: Vec<String>,
+    /// Cold-boot instead of restoring meda's cached snapshot (meda `cold`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cold: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

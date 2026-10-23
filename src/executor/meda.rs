@@ -116,6 +116,7 @@ pub(super) fn build_run_request(
         cpus: Some(spec.cpu),
         disk_size: Some(format!("{}G", spec.disk_gb)),
         devices,
+        cold: spec.meda_cold_boot,
     }
 }
 
@@ -292,11 +293,20 @@ mod gpu_wiring_tests {
             gpu,
             docker_privileged: false,
             docker_mount_socket: false,
+            meda_cold_boot: false,
             login: crate::executor::RunnerLogin {
                 username: String::new(),
                 password: String::new(),
             },
         }
+    }
+
+    #[test]
+    fn run_request_asks_meda_to_cold_boot_when_requested() {
+        let mut s = spec(GpuRequest::None);
+        s.meda_cold_boot = true;
+        let json = serde_json::to_value(build_run_request(&s, Vec::new())).unwrap();
+        assert_eq!(json["cold"], serde_json::Value::Bool(true), "{json}");
     }
 
     #[test]
@@ -336,5 +346,13 @@ mod gpu_wiring_tests {
             !json.contains("devices"),
             "empty devices must not serialize: {json}"
         );
+    }
+
+    #[test]
+    fn run_request_omits_cold_by_default() {
+        // Older meda versions don't know `cold`; leave it out unless asked.
+        let json =
+            serde_json::to_string(&build_run_request(&spec(GpuRequest::None), Vec::new())).unwrap();
+        assert!(!json.contains("cold"), "cold must not serialize: {json}");
     }
 }

@@ -163,6 +163,15 @@ pub fn resolve_executor_kind(
         .ok_or_else(|| format!("no default executor for os '{os}'"))
 }
 
+/// An opt-in boolean from `.cirun.yml`'s `extra_config`. Missing, wrong-typed
+/// or absent `extra_config` all mean `false` (the default behaviour).
+pub fn extra_config_flag(extra_config: Option<&serde_json::Value>, key: &str) -> bool {
+    extra_config
+        .and_then(|c| c.get(key))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 /// Whether `kind` can serve a runner with the given `runner_os`. Thin
 /// alias over [`ExecutorKind::produced_os`]; kept as a free function
 /// because the dispatch gate reads better as `executor_serves_os(k, os)`
@@ -249,6 +258,10 @@ pub struct RunnerSpec {
     /// container. Surfaces from `.cirun.yml` as
     /// `extra_config.docker_socket_mount: true`.
     pub docker_mount_socket: bool,
+    /// Meda-only: cold-boot the VM instead of restoring meda's cached
+    /// snapshot. Surfaces from `.cirun.yml` as `extra_config.cold_boot: true`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub meda_cold_boot: bool,
     pub login: RunnerLogin,
 }
 

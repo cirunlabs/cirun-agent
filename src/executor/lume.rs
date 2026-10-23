@@ -174,6 +174,7 @@ mod tests {
             gpu,
             docker_privileged: false,
             docker_mount_socket: false,
+            meda_cold_boot: false,
             login: crate::executor::RunnerLogin {
                 username: "u".into(),
                 password: "p".into(),
