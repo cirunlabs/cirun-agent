@@ -58,7 +58,8 @@ jobs:
           set -eux
           AGENT="$PWD/target/release/cirun-agent"
           test -x "$AGENT"
-          sudo -E "$AGENT" --install-service
+          # sudo-rs (Ubuntu 26.04+) ignores a bare `-E`; name the variable.
+          sudo --preserve-env=CIRUN_API_TOKEN "$AGENT" --install-service
           for i in $(seq 1 15); do
             if systemctl is-active --quiet cirun-agent; then
               echo "cirun-agent active after ${i}s"
