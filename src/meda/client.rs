@@ -171,6 +171,15 @@ impl MedaClient {
 
         info!("Deleting VM {}", name);
 
+        // meda answers a delete of a VM it doesn't have with a generic 500,
+        // which retrying can't fix. A VM meda doesn't list is already gone.
+        if let Ok(vms) = self.list_vms().await {
+            if !vms.iter().any(|vm| vm.name == name) {
+                info!("VM {} does not exist in meda, nothing to delete", name);
+                return Ok(());
+            }
+        }
+
         let send_delete_request =
             || async {
                 let response =
@@ -421,5 +430,86 @@ mod tests {
             Err(MedaError::ApiError(msg)) => assert!(msg.contains("panic")),
             other => panic!("expected ApiError, got {other:?}"),
         }
+    }
+
+    /// Fake meda API: `GET /vms` lists `vms`, every `DELETE` answers
+    /// `delete_status`. Returns the base URL and a log of request lines.
+    async fn fake_meda(
+        vms: &'static [&'static str],
+        delete_status: u16,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}/api/v1", listener.local_addr().unwrap());
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = requests.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 8192];
+                let n = socket.read(&mut buf).await.unwrap();
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let line = request.lines().next().unwrap_or_default().to_string();
+                log.lock().unwrap().push(line.clone());
+                let (status, body) = if line.starts_with("GET ") {
+                    let list: Vec<String> = vms
+                        .iter()
+                        .map(|n| format!(r#"{{"name":"{n}","state":"running","devices":[]}}"#))
+                        .collect();
+                    (200, format!(r#"{{"vms":[{}]}}"#, list.join(",")))
+                } else if delete_status == 200 {
+                    (200, r#"{"success":true}"#.to_string())
+                } else {
+                    (
+                        delete_status,
+                        r#"{"error":"Failed to delete VM","code":"VM_DELETE_ERROR"}"#.to_string(),
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (base_url, requests)
+    }
+
+    #[tokio::test]
+    async fn delete_of_vm_meda_does_not_have_succeeds_without_retrying() {
+        // SaaS keeps asking a rebuilt host to delete runners whose VMs died
+        // with the old disk. meda answers 500 for those; retrying can never
+        // help, and an error makes SaaS send the same delete every poll.
+        let (base_url, requests) = fake_meda(&["other-vm"], 500).await;
+        let client = MedaClient::with_base_url(&base_url).unwrap();
+
+        let started = std::time::Instant::now();
+        client.delete_vm("ghost-vm").await.unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "retried a missing VM"
+        );
+        let deletes = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.starts_with("DELETE"))
+            .count();
+        assert_eq!(deletes, 0);
+    }
+
+    #[tokio::test]
+    async fn delete_of_existing_vm_calls_meda() {
+        let (base_url, requests) = fake_meda(&["real-vm"], 200).await;
+        let client = MedaClient::with_base_url(&base_url).unwrap();
+
+        client.delete_vm("real-vm").await.unwrap();
+
+        assert!(requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.starts_with("DELETE /api/v1/vms/real-vm ")));
     }
 }
